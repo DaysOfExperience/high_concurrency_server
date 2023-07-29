@@ -234,10 +234,10 @@ public:
         return Send(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前发送为非阻塞。
     }
     // 创建一个tcp server的listen socket
-    bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = false) {
+    bool CreateListenSocket(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = true) {
         //1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞(可选)， 5. 启动地址重用
         if (Create() == false) return false;
-        if (block_flag) NonBlock();   // 指的是这个listen套接字为非阻塞
+        if (!block_flag) NonBlock();   // 指的是这个listen套接字为非阻塞
         if (Bind(ip, port) == false) return false;
         if (Listen() == false) return false;
         ReuseAddress();
@@ -345,7 +345,17 @@ public:
     void UpdateFromEpoll();
     // 事件处理: 调用此时所有就绪事件的回调函数，即处理当前文件描述符的就绪事件~
     void HandleEvent() {
-
+        if(_revents & EPOLLIN || _revents & EPOLLPRI || _revents & EPOLLHUP) {
+            if(_read_callback) _read_callback();
+        }
+        if(_revents & EPOLLOUT) {
+            if(_write_callback) _write_callback();
+        } else if(_revents & EPOLLERR) {
+            if(_error_callback) _error_callback();
+        } else if(_revents & EPOLLHUP) {
+            if(_close_callback) _close_callback();
+        }
+        if(_event_callback) _event_callback();
     }
 };
 #define MAX_EPOLLEVENTS 1024
@@ -429,6 +439,15 @@ private:
     Poller poller;
 public:
     EventLoop() {}
+    void Start() {
+        while(1) {
+            std::vector<Channel *> channels;
+            poller.Poll(&channels);
+            for(auto &i:channels) {
+                i->HandleEvent();
+            }
+        }
+    }
     // epoll相关
     // 添加描述符监控/修改描述符的事件监控
     void UpdateFromEpoll(Channel *ch) {
