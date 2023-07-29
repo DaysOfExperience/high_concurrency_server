@@ -1,15 +1,22 @@
 #ifndef __MUDUO_SERVER_HPP__
 #define __MUDUO_SERVER_HPP__
 
+#include <iostream>
 #include <vector>
 #include <string>
+#include <functional>
+#include <unordered_map>
 #include <cstring>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <unistd.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 
 #define INF 0
 #define DBG 1
@@ -121,7 +128,6 @@ public:
         _write_idx = 0;
     }
 };
-
 // 对套接字的封装，封装网络编程中的套接字相关的常用操作
 #define MAX_LISTEN 1024
 class Socket
@@ -229,7 +235,7 @@ public:
     }
     // 创建一个tcp server的listen socket
     bool CreateServer(uint16_t port, const std::string &ip = "0.0.0.0", bool block_flag = false) {
-        //1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞， 5. 启动地址重用
+        //1. 创建套接字，2. 绑定地址，3. 开始监听，4. 设置非阻塞(可选)， 5. 启动地址重用
         if (Create() == false) return false;
         if (block_flag) NonBlock();   // 指的是这个listen套接字为非阻塞
         if (Bind(ip, port) == false) return false;
@@ -262,4 +268,182 @@ public:
     }
 };
 
+// 事件管理: 该文件描述符关心哪些事件、哪些事件就绪、每个事件就绪时对应的回调函数
+class EventLoop;
+class Channel
+{
+private:
+    EventLoop *_event_loop;  // 封装了Poller(epoll)
+private:
+    int _fd;
+    uint32_t _events;   // 当前关心的事件
+    uint32_t _revents;  // 当前就绪的事件
+    using EventCallback = std::function<void()>;
+    EventCallback _read_callback;   // 可读事件就绪时的回调函数
+    EventCallback _write_callback;  // 可写事件就绪时的回调函数
+    EventCallback _error_callback;  // 错误事件就绪时的回调函数
+    EventCallback _close_callback;  // 连接断开事件就绪时的回调函数
+    EventCallback _event_callback;  // 任意事件就绪时的回调函数（重置计时器，证明该连接活跃）
+public:
+    Channel(EventLoop *p, int fd)
+    : _event_loop(p), _fd(fd), _events(0), _revents(0) {
+    }
+    int Fd() {
+        return _fd;
+    }
+    uint32_t Events() {
+        return _events;
+    }
+    // 设置当前就绪的事件（epoll模型在epool_wait之后进行设置）
+    void SetRevents(uint32_t revents) {
+        _revents = revents;
+    }
+    // 事件就绪的回调方法的设定，在channel定义后即进行。
+    void SetReadCallback(const EventCallback &cb) {
+        _read_callback = cb;
+    }
+    void SetWriteCallback(const EventCallback &cb) {
+        _write_callback = cb;
+    }
+    void SetErrorCallback(const EventCallback &cb) {
+        _error_callback = cb;
+    }
+    void SetCloseCallback(const EventCallback &cb) {
+        _close_callback = cb;
+    }
+    void SetEventCallback(const EventCallback &cb) {
+        _event_callback = cb;
+    }
+    // 关心可读/取消关心可读事件(一般来说，每个文件描述符（listen套接字，普通TCP连接，eventfd）开始时都只关心读事件)
+    // 下面几个方法都需要这个channel关联的epoll(EventLoop)来进行具体设定
+    // 且具有立即性，调用之后立刻生效
+    void EnableRead() {
+        _events |= EPOLLIN;
+        UpdateFromEpoll();
+    }
+    void DisableRead() {
+        _events &= ~EPOLLIN;
+        UpdateFromEpoll();
+    }
+    // 关心可写/取消关心可写
+    void EnableWrite() {
+        _events |= EPOLLOUT;
+        UpdateFromEpoll();
+    }
+    void DisableWrite() {
+        _events &= ~EPOLLOUT;
+        UpdateFromEpoll();
+    }
+    // // 取消所有事件监控(此时在epoll中还有什么意义吗?)     有用？
+    // void DisableAllEvent() {
+    //     _events = 0;
+    // }
+    // 从epoll中移除该文件描述符
+    // 下方两个方法调用了此channel绑定的epoll(EventLoop)的方法
+    // 调用的方法在其他类，且在下方定义，所以需要类体外定义(EventLoop定义后)
+    void RemoveFromEpoll();
+    void UpdateFromEpoll();
+    // 事件处理: 调用此时所有就绪事件的回调函数，即处理当前文件描述符的就绪事件~
+    void HandleEvent() {
+
+    }
+};
+#define MAX_EPOLLEVENTS 1024
+class Poller
+{
+private:
+    int _epfd;   // 仅仅只是epoll模型的一个标识
+    struct epoll_event _revs[MAX_EPOLLEVENTS];  // epoll_wait之后存储所有就绪的文件描述符及其就绪事件
+    std::unordered_map<int, Channel *> _channels; // 当前epoll监管了哪些文件描述符
+public:
+    Poller() {
+        _epfd = epoll_create(666);
+        if(_epfd < 0) {
+            ERR_LOG("EPOLL CREATE ERROR!!");
+            abort();
+        }
+    }
+    // 比如: 新增文件描述符监管，修改监管，移除监管。
+    // 单次epoll_wait
+    // 添加或修改文件描述符的事件监控
+    void UpdateFromEpoll(Channel *ch) {
+        auto it = _channels.find(ch->Fd());
+        if(it == _channels.end()) {
+            // 新增文件描述符监控
+            // 注意还要新增到_channels中
+            _channels.insert(std::make_pair(ch->Fd(), ch));
+            EpollCtl(ch, EPOLL_CTL_ADD);
+            return ;
+        }
+        // 更改文件描述符监控事件
+        EpollCtl(ch, EPOLL_CTL_MOD);
+    }
+    void RemoveFromEpoll(Channel *ch) {
+        if(_channels.find(ch->Fd()) == _channels.end())
+            return;
+        _channels.erase(ch->Fd());
+        EpollCtl(ch, EPOLL_CTL_DEL);
+    }
+    // 单次的epoll_wait，获取当前有事件就绪的文件描述符(返回活跃连接)
+    void Poll(std::vector<Channel *> *actives) {
+        int nfds = epoll_wait(_epfd, _revs, MAX_EPOLLEVENTS, -1); // -1阻塞、0非阻塞，>0定时阻塞
+        if(nfds < 0) {
+            if(errno == EINTR) {
+                return;
+            }
+            ERR_LOG("EPOLL WAIT ERROR : %s", strerror(errno));
+            abort();
+        }
+        // 此处nfds不可能等于0，因为是阻塞
+        for(int i = 0; i < nfds; ++i) {
+            int fd = _revs[i].data.fd;
+            uint32_t revents = _revs[i].events;
+            if(_channels.find(fd) == _channels.end()) {
+                ERR_LOG("POLL ERROR!!");
+                abort();
+            }
+            Channel *ch = _channels[fd];
+            ch->SetRevents(revents);
+            // ch->HandleEvent();   // 这里不handle
+            actives->push_back(ch);
+        }
+    }
+private:
+    void EpollCtl(Channel *ch, int op) {
+        // int epoll_ctl(int __epfd, int __op, int __fd, epoll_event *)
+        int fd = ch->Fd();
+        struct epoll_event ev;
+        ev.data.fd = fd;
+        ev.events = ch->Events();
+        int ret = epoll_ctl(_epfd, op, fd, &ev);
+        if(ret < 0) {
+            ERR_LOG("EPOLL CTL ERROR!!");
+            abort();
+        }
+        return ;
+    }
+};
+class EventLoop
+{
+private:
+    Poller poller;
+public:
+    EventLoop() {}
+    // epoll相关
+    // 添加描述符监控/修改描述符的事件监控
+    void UpdateFromEpoll(Channel *ch) {
+        poller.UpdateFromEpoll(ch);
+    }
+    void RemoveFromEpoll(Channel *ch) {
+        poller.RemoveFromEpoll(ch);
+    }
+};
+// 从epoll中移除该文件描述符
+void Channel::RemoveFromEpoll() {
+    _event_loop->RemoveFromEpoll(this);
+}
+// 新增文件描述符监管 / 修改文件描述符的监管事件
+void Channel::UpdateFromEpoll() {
+    _event_loop->UpdateFromEpoll(this);
+}
 #endif
