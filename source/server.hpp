@@ -7,6 +7,7 @@
 #include <functional>
 #include <unordered_map>
 #include <cstring>
+#include <cassert>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -345,17 +346,16 @@ public:
     void UpdateFromEpoll();
     // 事件处理: 调用此时所有就绪事件的回调函数，即处理当前文件描述符的就绪事件~
     void HandleEvent() {
-        if(_revents & EPOLLIN || _revents & EPOLLPRI || _revents & EPOLLHUP) {
+        if(_event_callback) _event_callback();
+        if((_revents & EPOLLIN) || (_revents & EPOLLPRI) || (_revents & EPOLLHUP)) {
             if(_read_callback) _read_callback();
-        }
-        if(_revents & EPOLLOUT) {
+        }else if(_revents & EPOLLOUT) {
             if(_write_callback) _write_callback();
         } else if(_revents & EPOLLERR) {
             if(_error_callback) _error_callback();
         } else if(_revents & EPOLLHUP) {
             if(_close_callback) _close_callback();
         }
-        if(_event_callback) _event_callback();
     }
 };
 #define MAX_EPOLLEVENTS 1024
@@ -404,17 +404,14 @@ public:
             ERR_LOG("EPOLL WAIT ERROR : %s", strerror(errno));
             abort();
         }
-        // 此处nfds不可能等于0，因为是阻塞
+        // 此处nfds不可能等于0，因为是阻塞式epoll_wait
         for(int i = 0; i < nfds; ++i) {
             int fd = _revs[i].data.fd;
             uint32_t revents = _revs[i].events;
-            if(_channels.find(fd) == _channels.end()) {
-                ERR_LOG("POLL ERROR!!");
-                abort();
-            }
+            assert(_channels.find(fd) != _channels.end());
             Channel *ch = _channels[fd];
             ch->SetRevents(revents);
-            // ch->HandleEvent();   // 这里不handle
+            // ch->HandleEvent();   // 这里不handle，外层获取了actives再handle，其实差不多
             actives->push_back(ch);
         }
     }
@@ -446,6 +443,8 @@ public:
             for(auto &i:channels) {
                 i->HandleEvent();
             }
+            // 调用listen套接字的读事件处理函数时，会接收新的通信套接字，然后调用EnableRead
+            // 进一步调用EventLoop的UpdateFromEpoll
         }
     }
     // epoll相关
