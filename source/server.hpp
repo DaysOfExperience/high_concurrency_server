@@ -489,6 +489,7 @@ public:
         _timerfd_channel->EnableRead();
     }
     ~TimerWheel() {}
+private:
     void TickOnce() {
         _tick += 1;
         _tick %= _size;
@@ -505,9 +506,9 @@ public:
     // 其实外部使用的就是下面这三个方法:1、添加任务2、刷新任务3、取消任务
     // 我们实现一个时间轮
     // timerfd用epoll监管，到时间，timerfd读就绪，根据读事件回调函数就执行Ontime，从而执行时间轮中任务而已。
-public:
+private:
     // 一个新的TCP连接，一个Timer定时任务，时间到了，代表超时，关闭非活跃连接
-    void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
+    void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb) {
         SharedTask pTask(new TimerTask(id, delay, cb));
         pTask->SetReleaseTimer(std::bind(&TimerWheel::RemoveTimer, this, id));
         int pos = (_tick + delay) % _size;   // 这个任务放入的时间轮的位置
@@ -515,7 +516,7 @@ public:
         _timers.insert({id, WeakTask(pTask)});   // 利用shared_ptr构造weak_ptr?
     }
     // 当一个TCP连接事件就绪，代表活跃，刷新定时任务，重新计时
-    void TimerRefresh(uint64_t id) {
+    void TimerRefreshInLoop(uint64_t id) {
         // 通过id在unordered_map中找到对应的保存的定时器对象的weak_ptr构造一个shared_ptr出来，添加到轮子中。
         auto it = _timers.find(id);
         if(it == _timers.end()) {
@@ -527,13 +528,35 @@ public:
         _timerwheel[pos].push_back(pTask);
     }
     // 当一个连接突然关闭，要取消对应的定时任务~
-    void TimerCancel(uint64_t id) {
+    void TimerCancelInLoop(uint64_t id) {
         auto it = _timers.find(id);
         if(it == _timers.end()) {
             return ;   // 任务不存在
         }
         SharedTask pTask = it->second.lock();
         if(pTask) pTask->Cancel();
+    }
+public:
+    /*定时器中有个_timers成员，定时器数据的操作有可能在多线程中进行，因此需要考虑线程安全问题*/
+    /*如果不想加锁，那就把对定时器的所有操作，都放到一个线程中进行*/
+
+    // 下面的三个方法，不能直接执行，因为存在线程安全问题
+    // 确保这些方法在EventLoop这个线程中执行就没有线程安全问题了。
+    // 所以调用RunInLoop
+
+    // 确保执行下方函数时，要在EventLoop线程中
+    // 如果在，则直接执行，如果不在则push到EventLoop的任务队列中
+    void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb);
+    // 刷新/延迟定时任务
+    void TimerRefresh(uint64_t id);
+    void TimerCancel(uint64_t id);
+    /*这个接口存在线程安全问题--这个接口实际上不能被外界使用者调用，只能在模块内，在对应的EventLoop线程内执行*/
+    bool HasTimer(uint64_t id) {
+        auto it = _timers.find(id);
+        if (it == _timers.end()) {
+            return false;
+        }
+        return true;
     }
 private:
     // 用于当某TimerTask析构执行任务时，需要从_timers里面移除
@@ -626,10 +649,6 @@ public:
         }
         return ;
     }
-    // 用于判断当前线程是否是EventLoop对应的线程；
-    bool IsInLoop() {
-        return (_thread_id == std::this_thread::get_id());
-    }
     void AssertInLoop() {
         assert(_thread_id == std::this_thread::get_id());
     }
@@ -639,6 +658,10 @@ public:
             return cb();
         }
         return PushInTasks(cb);
+    }
+    // 用于判断当前线程是否是EventLoop对应的线程；
+    bool IsInLoop() {
+        return (_thread_id == std::this_thread::get_id());
     }
     // 将操作压入任务池
     void PushInTasks(const Task &cb) {
@@ -694,6 +717,18 @@ public:
         }
         return ;
     }
+    void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
+        return _timer_wheel.TimerAdd(id, delay, cb);
+    }
+    void TimerRefresh(uint64_t id) {
+        return _timer_wheel.TimerRefresh(id);
+    }
+    void TimerCancel(uint64_t id) { 
+        return _timer_wheel.TimerCancel(id); 
+    }
+    bool HasTimer(uint64_t id) {
+        return _timer_wheel.HasTimer(id);
+    }
 };
 // 从epoll中移除该文件描述符
 void Channel::RemoveFromEpoll() {
@@ -702,5 +737,15 @@ void Channel::RemoveFromEpoll() {
 // 新增文件描述符监管 / 修改文件描述符的监管事件
 void Channel::UpdateFromEpoll() {
     _event_loop->UpdateFromEpoll(this);
+}
+void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
+}
+// 刷新/延迟定时任务
+void TimerWheel::TimerRefresh(uint64_t id) {
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerRefreshInLoop, this, id));
+}
+void TimerWheel::TimerCancel(uint64_t id) {
+    _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
 }
 #endif
