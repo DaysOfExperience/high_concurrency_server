@@ -6,6 +6,7 @@
 #include <string>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <functional>
 #include <unordered_map>
 #include <cstring>
@@ -236,6 +237,7 @@ public:
         return ret;//实际发送的数据长度
     }
     ssize_t SendNonBlock(const void *buf, size_t len) {
+        if(len == 0) return 0;
         return Send(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前发送为非阻塞。
     }
     // 创建一个tcp server的listen socket
@@ -273,8 +275,9 @@ public:
     }
 };
 
-// 事件管理: 该文件描述符关心哪些事件、哪些事件就绪、每个事件就绪时对应的回调函数
+// 事件管理类: 该文件描述符关心哪些事件、哪些事件就绪、每个事件就绪时对应的回调函数
 class EventLoop;
+/*1. 提供EventLoop*(该文件描述符的监管放在哪个Epoll中了)和fd 2. 回调函数设定 3. 该文件描述符想要关心哪些事件(Enable)*/
 class Channel
 {
 private:
@@ -290,6 +293,8 @@ private:
     EventCallback _close_callback;  // 连接断开事件就绪时的回调函数
     EventCallback _event_callback;  // 任意事件就绪时的回调函数（重置计时器，证明该连接活跃）
 public:
+    // 常规操作：初始化时,提供EventLoop*和fd，回调函数设定，以及该文件描述符想要关心哪些事件
+    // 就好了，在对应事件发生时，会自动在EventLoop对应的Poller中进行事件回调~~
     Channel(EventLoop *p, int fd)
     : _event_loop(p), _fd(fd), _events(0), _revents(0) {
     }
@@ -363,6 +368,8 @@ public:
     }
 };
 #define MAX_EPOLLEVENTS 1024
+/*该类直接被EventLoop封装。构造时，直接构造一个Epoll模型。
+提供两个接口1. void UpdateFromEpoll(Channel *ch) 2. void RemoveFromEpoll(Channel *ch) 3. Poll(一次epoll_wait)*/
 class Poller
 {
 private:
@@ -435,15 +442,15 @@ private:
         return ;
     }
 };
-using TaskFunc = std::function<void()>;
 class TimerTask
 {
 private:
-    uint64_t _id;       // 任务id
+    uint64_t _id;       // 定时任务唯一id
     uint32_t _timeout;  // 定时时长
+    using TaskFunc = std::function<void()>;
     using ReleaseTimer = std::function<void()>;
     TaskFunc _task_cb;  // 定时器对象要执行的定时任务
-    ReleaseTimer _release; // 用于删除TimerWheel中保存的定时器对象信息
+    ReleaseTimer _release; // 用于删除TimerWheel中保存的TimerTask
     bool _canceled;
 public:
     TimerTask(uint64_t id, uint32_t delay, const TaskFunc &cb)
@@ -468,6 +475,7 @@ class TimerWheel
 private:
     using SharedTask = std::shared_ptr<TimerTask>;
     using WeakTask = std::weak_ptr<TimerTask>;
+    using TaskFunc = std::function<void()>;
     int _size;  // 时间轮大小，与最大定时时间相关
     int _tick;  // 时间轮的秒针，每向前一步，就会执行时间轮的一个轮子里面的所有任务(具体多久走一步，取决于timerfd)
     std::vector<std::vector<SharedTask>> _timerwheel;
@@ -503,9 +511,32 @@ private:
             TickOnce();
         }
     }
-    // 其实外部使用的就是下面这三个方法:1、添加任务2、刷新任务3、取消任务
     // 我们实现一个时间轮
     // timerfd用epoll监管，到时间，timerfd读就绪，根据读事件回调函数就执行Ontime，从而执行时间轮中任务而已。
+
+public:
+    /*定时器中有个_timers成员，定时器数据的操作有可能在多线程中进行，因此需要考虑线程安全问题*/
+    /*如果不想加锁，那就把对定时器的所有操作，都放到一个线程中进行*/
+
+    // 下面的三个方法，不能直接执行，因为存在线程安全问题
+    // 确保这些方法在EventLoop对应的线程中执行就没有线程安全问题了。
+    // 所以调用RunInLoop
+
+    // 确保执行下方函数时，要在EventLoop线程中
+    // 如果在，则直接执行，如果不在则push到EventLoop的任务队列中
+    void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb);
+    // 刷新/延迟定时任务
+    void TimerRefresh(uint64_t id);
+    void TimerCancel(uint64_t id);
+    /*这个接口存在线程安全问题--这个接口实际上不能被外界使用者调用，只能在模块内，在对应的EventLoop线程内执行*/
+    bool HasTimer(uint64_t id) {
+        auto it = _timers.find(id);
+        if (it == _timers.end()) {
+            return false;
+        }
+        return true;
+    }
+    // 其实外部使用的就是上面这三个方法:1、添加任务2、刷新任务3、取消任务
 private:
     // 一个新的TCP连接，一个Timer定时任务，时间到了，代表超时，关闭非活跃连接
     void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb) {
@@ -527,7 +558,7 @@ private:
         int pos = (_tick + delay) % _size;
         _timerwheel[pos].push_back(pTask);
     }
-    // 当一个连接突然关闭，要取消对应的定时任务~
+    // 当一个连接突然关闭，要取消对应的定时任务~(只是到时间之后不会执行对应任务，实则对应任务还是在_timers内的，这里不回删除)
     void TimerCancelInLoop(uint64_t id) {
         auto it = _timers.find(id);
         if(it == _timers.end()) {
@@ -535,28 +566,6 @@ private:
         }
         SharedTask pTask = it->second.lock();
         if(pTask) pTask->Cancel();
-    }
-public:
-    /*定时器中有个_timers成员，定时器数据的操作有可能在多线程中进行，因此需要考虑线程安全问题*/
-    /*如果不想加锁，那就把对定时器的所有操作，都放到一个线程中进行*/
-
-    // 下面的三个方法，不能直接执行，因为存在线程安全问题
-    // 确保这些方法在EventLoop这个线程中执行就没有线程安全问题了。
-    // 所以调用RunInLoop
-
-    // 确保执行下方函数时，要在EventLoop线程中
-    // 如果在，则直接执行，如果不在则push到EventLoop的任务队列中
-    void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb);
-    // 刷新/延迟定时任务
-    void TimerRefresh(uint64_t id);
-    void TimerCancel(uint64_t id);
-    /*这个接口存在线程安全问题--这个接口实际上不能被外界使用者调用，只能在模块内，在对应的EventLoop线程内执行*/
-    bool HasTimer(uint64_t id) {
-        auto it = _timers.find(id);
-        if (it == _timers.end()) {
-            return false;
-        }
-        return true;
     }
 private:
     // 用于当某TimerTask析构执行任务时，需要从_timers里面移除
@@ -604,11 +613,15 @@ private:
     
     Poller poller;
 
+    // 我他妈之前一直不明白_tasks为什么涉及线程安全
+    // 比如: EventLoop线程在Start内RunAllTask访问_tasks
+    // 而主线程在用RunInLoop往_tasks内push_back任务。就涉及线程安全
     using Task = std::function<void()>;
     std::vector<Task> _tasks;// 任务池
     std::mutex _mutex;// 实现任务池操作的线程安全
 
     // 时间轮定时器模块：用timerfd，每秒读事件就绪一次，epoll检测到，调用读事件处理函数，tick前移，执行某轮子中的任务
+    using TaskFunc = std::function<void()>;
     TimerWheel _timer_wheel;  // 定时器模块
 public:
     EventLoop():
@@ -616,6 +629,8 @@ public:
     _event_fd(CreateEventFd()), 
     _event_channel(new Channel(this, _event_fd)),
     _timer_wheel(this) {
+        // 有关timerwheel：在构造TimerWheel的对象时，传过去EventLoop指针，就已经完成了所有操作了，包括timerfd的回调设定
+        // 包括timerfd在EventLoop中的读事件关心。外部可以调用TimerWheel的三个接口进行任务添加，刷新，删除~(RunInLoop)
         _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventfd, this));
         _event_channel->EnableRead();
         // 将eventfd的读事件监督交给epoll(poller)，这样可以通过WriteEventfd来唤醒阻塞在epoll_wait中的epoll线程。
@@ -657,14 +672,14 @@ public:
         if (IsInLoop()) {
             return cb();
         }
-        return PushInTasks(cb);
+        return QueueInLoop(cb);
     }
     // 用于判断当前线程是否是EventLoop对应的线程；
     bool IsInLoop() {
         return (_thread_id == std::this_thread::get_id());
     }
     // 将操作压入任务池
-    void PushInTasks(const Task &cb) {
+    void QueueInLoop(const Task &cb) {
         {
             std::unique_lock<std::mutex> _lock(_mutex);
             _tasks.push_back(cb);
@@ -717,6 +732,7 @@ public:
         }
         return ;
     }
+    // TimerWheel相关: 实现非活跃连接销毁功能
     void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
         return _timer_wheel.TimerAdd(id, delay, cb);
     }
@@ -730,13 +746,13 @@ public:
         return _timer_wheel.HasTimer(id);
     }
 };
-// 从epoll中移除该文件描述符
-void Channel::RemoveFromEpoll() {
-    _event_loop->RemoveFromEpoll(this);
-}
 // 新增文件描述符监管 / 修改文件描述符的监管事件
 void Channel::UpdateFromEpoll() {
     _event_loop->UpdateFromEpoll(this);
+}
+// 从epoll中移除该文件描述符
+void Channel::RemoveFromEpoll() {
+    _event_loop->RemoveFromEpoll(this);
 }
 void TimerWheel::TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerAddInLoop, this, id, delay, cb));
@@ -748,4 +764,259 @@ void TimerWheel::TimerRefresh(uint64_t id) {
 void TimerWheel::TimerCancel(uint64_t id) {
     _loop->RunInLoop(std::bind(&TimerWheel::TimerCancelInLoop, this, id));
 }
+// 因为EventLoop必须与一个线程绑定，而EventLoop在构造函数中就会以构造它的线程作为绑定线程。
+// 因此我们不能在主线程（主Reactor）中创建EventLoop
+/*创建一个LoopThread相当于直接创建了一个从Reactor线程，开始EventLoop*/
+class LoopThread
+{
+private:
+    EventLoop *_loop;
+    std::thread _thread;
+    std::mutex _mutex;
+    std::condition_variable _cond;
+public:
+    LoopThread(): _loop(nullptr), _thread(&LoopThread::ThreadIntry, this) 
+    { }
+    EventLoop *GetLoop() {
+        std::unique_lock<std::mutex> lock(_mutex); // 加锁
+        _cond.wait(lock, [&](){ return _loop != NULL; });  // 若条件不达成，则在条件变量下等待，且释放_mutex;
+        return _loop;
+    }
+private:
+    // 实际上，每一个从Reactor线程都执行的是这个函数~
+    void ThreadIntry() {
+        EventLoop loop;
+        {
+            std::unique_lock<std::mutex> lock(_mutex); // 加锁
+            _loop = &loop;
+            _cond.notify_all();
+        }
+        loop.Start();
+    }
+};
+class LoopThreadPool
+{
+private:
+    int _thread_num;   // 线程池内线程个数
+    int _loop_index;
+    EventLoop *_base_loop;
+    std::vector<LoopThread *> _threads;
+    std::vector<EventLoop *> _loops;
+public:
+    /*if thread_num == 0, then you should set base_loop
+      if not, you could not set base_loop */
+    LoopThreadPool(int thread_num, EventLoop *base_loop = nullptr) :
+        _thread_num(thread_num), _loop_index(0), _base_loop(base_loop) {
+        for(int i = 0; i < _thread_num; ++i) {
+            _threads.push_back(new LoopThread());
+            _loops.push_back((*_threads.end())->GetLoop());  // safely
+        }
+    }
+    EventLoop *GetLoopBalanced() {
+        if(_thread_num == 0) return _base_loop;
+        _loop_index = (_loop_index + 1) % _thread_num;
+        return _loops[_loop_index];
+    }
+};
+typedef enum {
+    CONNECTING,    // 建立连接初步完成，待处理状态
+    CONNECTED,     // 连接建立完成，各种设置已完成，可以通信的状态
+    DISCONNECTING, // 待关闭状态
+    DISCONNECTED   // 连接关闭状态
+} ConnStatus;
+class Connection : public std::enable_shared_from_this<Connection> 
+{
+private:
+    uint64_t _conn_id;  // 连接的唯一ID
+    uint64_t _timer_id; // 连接对应的定时任务的ID(超时删除)，具有唯一性即可，故为了方便默认设为_conn_id
+    int _sockfd;        // 连接关联的文件描述符
+    ConnStatus _status; // 连接状态
+    bool _enable_inactive_release; // 连接是否开启非活跃销毁，默认false
+
+    EventLoop *_loop;   // 连接所在的EventLoop(epoll)
+
+    Socket _socket;
+    Channel _channel;
+    Buffer _in_buffer;
+    Buffer _out_buffer;
+    
+private:
+    using PtrConnection = std::shared_ptr<Connection>;
+    using MessageCallback = std::function<void (const PtrConnection &, Buffer *in_buffer)>;
+    using ConnectedCallback = std::function<void (const PtrConnection &)>;
+    using CloseCallback = std::function<void (const PtrConnection &)>;
+    using AnyEventCallback = std::function<void (const PtrConnection &)>;
+    // HandleRead读事件监控回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
+    // 进行业务处理，业务处理函数即_message_callback，为用户设定的
+    MessageCallback _message_callback;
+    ConnectedCallback _connected_callback;
+    CloseCallback _close_callback;
+    AnyEventCallback _any_event_callback;
+
+    CloseCallback _server_close_callback;
+public:
+    // 和Channel的构造的唯一区别就是多了一个_conn_id而已
+    Connection(EventLoop *loop, uint64_t id, int sockfd):
+        _conn_id(id), _timer_id(id), _sockfd(sockfd), _status(CONNECTING), _enable_inactive_release(false),
+        _loop(loop), _socket(_socket), _channel(_loop, _sockfd), _in_buffer(), _out_buffer() {
+        _channel.SetReadCallback(std::bind(&Connection::HandleRead, this));
+        _channel.SetWriteCallback(std::bind(&Connection::HandleWrite, this));
+        _channel.SetCloseCallback(std::bind(&Connection::HandleClose, this));
+        _channel.SetErrorCallback(std::bind(&Connection::HandleError, this));
+        _channel.SetEventCallback(std::bind(&Connection::HandleEvent, this));
+    }
+    ~Connection() {}
+    // int Fd() {
+    // }
+    // int Id() {
+    // }
+    void SetMessageCallback(const MessageCallback &cb) {
+        _message_callback = cb;
+    }
+    void SetConnectedCallback(const ConnectedCallback &cb) {
+        _connected_callback = cb;
+    }
+    void SetCloseCallback(const CloseCallback &cb) {
+        _close_callback = cb;
+    }
+    void SetAnyEventCallback(const AnyEventCallback &cb) {
+        _any_event_callback = cb;
+    }
+    void SetSvrCloseCallback(const CloseCallback &cb) {
+        _server_close_callback = cb;
+    }
+    void Establish() {
+
+    }
+    void Send(const char *data, size_t len) {
+
+    }
+    void EnableInactiveRelease(int sec) {
+
+    }
+    void CancelInactiveRelease() {
+
+    }
+private:
+    void HandleRead() {
+
+    }
+    void HandleWrite() {
+
+    }
+    void HandleClose() {
+
+    }
+    void HandleError() {
+
+    }
+    void HandleEvent() {
+
+    }
+};
+// Connection是对TCP通信套接字的同一管理，Acceptor是对listen套接字的统一管理
+class Acceptor
+{
+private:
+    Socket _listen_socket;
+    // EventLoop *_base_loop;   // 没有存在的必要~
+    Channel _channel;
+
+    using AcceptCallback = std::function<void(int)>;
+    AcceptCallback _accept_callback;
+public:
+    Acceptor(EventLoop *base_loop, int port) :
+        _listen_socket(CreateListenSocket(port)),
+        _channel(base_loop, _listen_socket.Fd()) {
+        _channel.SetReadCallback(std::bind(&Acceptor::HandleRead, this));
+        // 这里只是设定了listen套接字的读事件回调函数，也就是HandleRead
+        // 但是还没有启动读事件关心在_base_loop上
+    }
+    void SetAcceptCallback(const AcceptCallback& cb) {
+        _accept_callback = cb;
+    }
+    // 启动listen套接字的读事件关心在_base_loop上
+    // 自此，有client连接之后，listen套接字的读事件就绪，就会开始回调（HandleRead)
+    void Listen() {
+        _channel.EnableRead();
+    }
+private:
+    void HandleRead() {
+        int newfd = _listen_socket.Accept();
+        if(newfd == -1) return ;
+        if(_accept_callback) _accept_callback(newfd);  // 具体主Reactor获取一个newfd之后，怎么分配到从Reactor，就是_accept_callback的工作了
+    }
+    int CreateListenSocket(int port) {
+        bool ret = _listen_socket.CreateListenSocket(port);
+        assert(ret == true);
+        return _listen_socket.Fd();
+    }
+};
+class TcpServer
+{
+private:
+    uint64_t _conn_id;   // 自动增长的Connection ID
+    int _port;
+    int _timeout;
+    bool _enable_inactive_release;
+
+    EventLoop _base_loop;
+    Acceptor _acceptor;
+    LoopThreadPool _pool;
+    using PtrConnection = std::shared_ptr<Connection>;
+    std::unordered_map<uint64_t, PtrConnection> _conns;
+
+    // HandleRead读事件监控回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
+    // 进行业务处理，业务处理函数即_message_callback，为用户设定的。
+    using MessageCallback = std::function<void (const PtrConnection &, Buffer *in_buffer)>;
+    using ConnectedCallback = std::function<void (const PtrConnection &)>;
+    using CloseCallback = std::function<void (const PtrConnection &)>;
+    using AnyEventCallback = std::function<void (const PtrConnection &)>;
+    MessageCallback _message_callback;
+    ConnectedCallback _connected_callback;
+    CloseCallback _close_callback;
+    AnyEventCallback _any_event_callback;
+public:
+    /*if you want to create a Single threaded Reactor mode TCP server
+    , please set 0 to the thread_num */
+    // 若开启非活跃连接销毁功能，则第三个参数应设定为超时时间(>0)/
+    TcpServer(int port, int thread_num = 2, int timeout = -1):
+    _conn_id(0),
+    _port(port),
+    _timeout(0),
+    _enable_inactive_release(false),
+    _base_loop(),
+    _acceptor(&_base_loop, _port),
+    _pool(thread_num, &_base_loop) {
+        // 先进行第一步，获取新连接之后才能分配到从属Reactor线程池中，再启动_base_loop对于listen套接字的读关心
+        // 否则在获取新客户端连接之后，无法将新连接分配到从属Reactor线程池中，因为Acceptor的_accept_callback为空~
+        _acceptor.SetAcceptCallback(xxx);
+        _acceptor.Listen();
+        if(timeout > 0) {
+            _timeout = timeout;
+            _enable_inactive_release = true;
+        }
+    }
+    // 业务处理函数的设定
+    void SetMessageCallback(const MessageCallback &cb) {
+        _message_callback = cb;
+    }
+    // 可有可无，看User的需求~
+    void SetConnectedCallback(const ConnectedCallback &cb) {
+        _connected_callback = cb;
+    }
+    void SetCloseCallback(const CloseCallback &cb) {
+        _close_callback = cb;
+    }
+    void SetAnyEventCallback(const AnyEventCallback &cb) {
+        _any_event_callback = cb;
+    }
+    void AddTask() {
+
+    }
+    void Start() {
+        _base_loop.Start();   // 主Reactor线程开始eventloop获取新连接，从属Reactor线程在构造时就已经开始eventloop了
+        // 但是因为主线程还没开始，所以是安全的~
+    }
+};
 #endif
