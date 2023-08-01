@@ -650,6 +650,13 @@ public:
             RunAllTask();
         }
     }
+    // 判断将要执行的任务是否处于当前线程中，如果是则执行，不是则压入队列。
+    void RunInLoop(const Task &cb) {
+        if (IsInLoop()) {
+            return cb();
+        }
+        return QueueInLoop(cb);
+    }
     // 线程安全的任务池相关的   ????
     void RunAllTask() {
         // 执行任务池中的所有任务
@@ -666,13 +673,6 @@ public:
     }
     void AssertInLoop() {
         assert(_thread_id == std::this_thread::get_id());
-    }
-    // 判断将要执行的任务是否处于当前线程中，如果是则执行，不是则压入队列。
-    void RunInLoop(const Task &cb) {
-        if (IsInLoop()) {
-            return cb();
-        }
-        return QueueInLoop(cb);
     }
     // 用于判断当前线程是否是EventLoop对应的线程；
     bool IsInLoop() {
@@ -941,10 +941,12 @@ public:
         _channel.EnableRead();
     }
 private:
+    // 主Reactor线程执行这个~
     void HandleRead() {
         int newfd = _listen_socket.Accept();
         if(newfd == -1) return ;
-        if(_accept_callback) _accept_callback(newfd);  // 具体主Reactor获取一个newfd之后，怎么分配到从Reactor，就是_accept_callback的工作了
+        // 具体主Reactor线程获取一个newfd之后，怎么分配到从Reactor线程池，就是_accept_callback的工作了（TcpServer设定）
+        if(_accept_callback) _accept_callback(newfd);
     }
     int CreateListenSocket(int port) {
         bool ret = _listen_socket.CreateListenSocket(port);
@@ -960,9 +962,9 @@ private:
     int _timeout;
     bool _enable_inactive_release;
 
-    EventLoop _base_loop;
+    EventLoop _base_loop;    // 主Reactor线程
     Acceptor _acceptor;
-    LoopThreadPool _pool;
+    LoopThreadPool _pool;    // 从属Reactor线程池
     using PtrConnection = std::shared_ptr<Connection>;
     std::unordered_map<uint64_t, PtrConnection> _conns;
 
@@ -972,10 +974,10 @@ private:
     using ConnectedCallback = std::function<void (const PtrConnection &)>;
     using CloseCallback = std::function<void (const PtrConnection &)>;
     using AnyEventCallback = std::function<void (const PtrConnection &)>;
-    MessageCallback _message_callback;
-    ConnectedCallback _connected_callback;
-    CloseCallback _close_callback;
-    AnyEventCallback _any_event_callback;
+    MessageCallback _message_callback = nullptr;
+    ConnectedCallback _connected_callback = nullptr;
+    CloseCallback _close_callback = nullptr;
+    AnyEventCallback _any_event_callback = nullptr;
 public:
     /*if you want to create a Single threaded Reactor mode TCP server
     , please set 0 to the thread_num */
@@ -991,7 +993,7 @@ public:
         // 先进行第一步，获取新连接之后才能分配到从属Reactor线程池中，再启动_base_loop对于listen套接字的读关心
         // 否则在获取新客户端连接之后，无法将新连接分配到从属Reactor线程池中，因为Acceptor的_accept_callback为空~
         _acceptor.SetAcceptCallback(xxx);
-        _acceptor.Listen();
+        _acceptor.Listen();    // 在base_loop中开启listen套接字的读事件关心
         if(timeout > 0) {
             _timeout = timeout;
             _enable_inactive_release = true;
@@ -1015,8 +1017,30 @@ public:
 
     }
     void Start() {
-        _base_loop.Start();   // 主Reactor线程开始eventloop获取新连接，从属Reactor线程在构造时就已经开始eventloop了
-        // 但是因为主线程还没开始，所以是安全的~
+        _base_loop.Start();
+        // 主Reactor线程开始eventloop获取新连接
+        // 从属Reactor线程在构造时就已经开始eventloop了(但是关心的文件描述符数量为空)
+        // 因为主Reactor线程还没开始，所以从属Reactor线程池是安全的~
+    }
+private:
+    // 主Reactor线程获取新连接之后执行这个~
+    void NewConnection(int fd) {
+        EventLoop *loop = _pool.GetLoopBalanced();
+        PtrConnection p(new Connection(loop, _conn_id, fd));
+        // User设定的业务处理函数，一定需要的
+        p->SetMessageCallback(_message_callback);
+        // 可有可无，但是如果User设定了，则需要设定
+        p->SetConnectedCallback(_connected_callback);
+        p->SetCloseCallback(_close_callback);
+        p->SetAnyEventCallback(_any_event_callback);
+        p->SetSvrCloseCallback(xxxxxx);
+        if(_enable_inactive_release) p->EnableInactiveRelease(_timeout);  // 非活跃连接超时自动销毁
+
+        // 到此为止，新连接的事件监控还没有开启
+        
+        p->Establish();   // ?????
+        _conns.insert({_conn_id, p});
+        ++_conn_id;
     }
 };
 #endif
