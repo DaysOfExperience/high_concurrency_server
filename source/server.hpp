@@ -876,8 +876,9 @@ public:
     ~Connection() {}
     // int Fd() {
     // }
-    // int Id() {
-    // }
+    uint64_t Id() {
+        return _conn_id;
+    }
     // bool Connected() { return (_statu == CONNECTED); }
     // void SetContext(const Any &context) { _context = context; }
     // Any *GetContext() { return &_context; }
@@ -1122,16 +1123,21 @@ public:
     }
     // 添加一个定时任务
     void RunAfter(Functor func, int delay) {
-        ...
+        _base_loop.RunInLoop(std::bind(&TcpServer::RunAfterInLoop, this, func, delay));
     }
-    void RunAfterInLoop() {
-        ...
+    void RunAfterInLoop(Functor func, int delay) {
+        _conn_id++;
+        _base_loop.TimerAdd(_conn_id, delay, func);
     }
-    void RemoveConnection() {
-        ...
+    void RemoveConnection(const PtrConnection &conn) {
+        _base_loop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
     }
-    void RemoveConnectionInLoop() {
-        ...
+    void RemoveConnectionInLoop(const PtrConnection &conn) {
+        // 将Connection从_conns中移除掉
+        uint64_t id = conn->Id();
+        if(_conns.find(id) == _conns.end()) {
+            _conns.erase(id);
+        }
     }
     void Start() {
         _base_loop.Start();
@@ -1150,7 +1156,7 @@ private:
         conn->SetConnectedCallback(_connected_callback);
         conn->SetCloseCallback(_close_callback);
         conn->SetAnyEventCallback(_any_event_callback);
-        conn->SetSvrCloseCallback(xxxxxx);
+        conn->SetSvrCloseCallback(std::bind(&TcpServer::RemoveConnection, this, std::placeholders::_1));
         if(_enable_inactive_release) conn->EnableInactiveRelease(_timeout);  // 非活跃连接超时自动销毁
         // 到此为止，新连接的事件监控还没有开启
         conn->Establish();
