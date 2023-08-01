@@ -65,6 +65,10 @@ public:
     char *WritePosition() {
         return Begin() + _write_idx;
     }
+    void MoveReadOffset(ssize_t len) {
+        // 比如发送缓冲区的数据发出去了，从外部需要移动一下
+        _read_idx += len;
+    }
     // 末尾空余空间大小(字节数)
     uint64_t TailIdleSize() {
         return _buffer.size() - _write_idx;
@@ -504,6 +508,7 @@ private:
         // 销毁这个轮子上的所有智能指针，若引用计数变为0，则执行TimerTask的析构函数，执行定时任务（若没有cancel）
         _timerwheel[_tick].clear();
     }
+    // 可以说，下面这个操作，每到一次时间都会执行，只是时间轮里面可能没有任务而已。
     void Ontime() {
         // 根据实际超时的次数，执行对应的超时任务
         int times = ReadTimefd();
@@ -635,6 +640,7 @@ public:
         _event_channel->EnableRead();
         // 将eventfd的读事件监督交给epoll(poller)，这样可以通过WriteEventfd来唤醒阻塞在epoll_wait中的epoll线程。
     }
+    // 真-Event Loop
     void Start() {
         // 事件监控 -> 事件处理 -> 执行任务(????)
         while(1) {
@@ -819,7 +825,7 @@ public:
     }
 };
 typedef enum {
-    CONNECTING,    // 建立连接初步完成，待处理状态
+    CONNECTING,    // 建立连接初步完成，待处理状态（实际上待处理的任务就是:读事件关心一下）
     CONNECTED,     // 连接建立完成，各种设置已完成，可以通信的状态
     DISCONNECTING, // 待关闭状态
     DISCONNECTED   // 连接关闭状态
@@ -839,7 +845,6 @@ private:
     Channel _channel;
     Buffer _in_buffer;
     Buffer _out_buffer;
-    
 private:
     using PtrConnection = std::shared_ptr<Connection>;
     using MessageCallback = std::function<void (const PtrConnection &, Buffer *in_buffer)>;
@@ -849,13 +854,16 @@ private:
     // HandleRead读事件监控回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
     // 进行业务处理，业务处理函数即_message_callback，为用户设定的
     MessageCallback _message_callback;
+    // 连接建立时的回调函数，用户想让连接建立时执行个什么东西，就通过这个设定~
     ConnectedCallback _connected_callback;
     CloseCallback _close_callback;
+    // 在任意事件触发时，就会调用这个~~~（如果User设定了的话）
     AnyEventCallback _any_event_callback;
 
     CloseCallback _server_close_callback;
 public:
     // 和Channel的构造的唯一区别就是多了一个_conn_id而已
+    // 在Connection构造时，会设定状态为CONNECTING
     Connection(EventLoop *loop, uint64_t id, int sockfd):
         _conn_id(id), _timer_id(id), _sockfd(sockfd), _status(CONNECTING), _enable_inactive_release(false),
         _loop(loop), _socket(_socket), _channel(_loop, _sockfd), _in_buffer(), _out_buffer() {
@@ -870,6 +878,9 @@ public:
     // }
     // int Id() {
     // }
+    // bool Connected() { return (_statu == CONNECTED); }
+    // void SetContext(const Any &context) { _context = context; }
+    // Any *GetContext() { return &_context; }
     void SetMessageCallback(const MessageCallback &cb) {
         _message_callback = cb;
     }
@@ -886,33 +897,128 @@ public:
         _server_close_callback = cb;
     }
     void Establish() {
-
+        // 调用这个连接所绑定的EventLoop的方法
+        _loop->RunInLoop(std::bind(&Connection::EstablishInLoop, this));
     }
     void Send(const char *data, size_t len) {
-
+        ...
+    }
+    void Shutdown() {
+        _loop->RunInLoop(std::bind(&Connection::ShutdownInLoop, this));
+    }
+    void Release() {
+        _loop->RunInLoop(std::bind(&Connection::ReleaseInLoop, this));
     }
     void EnableInactiveRelease(int sec) {
-
+        // 主线程创建新Connection时执行这里~
+        // 让连接对应绑定的线程执行EnableInactiveReleaseInLoop~~~~   hhhhhh
+        _loop->RunInLoop(std::bind(&Connection::EnableInactiveReleaseInLoop, this, sec));
     }
-    void CancelInactiveRelease() {
-
-    }
+    // 实际上没有被调用过，只是提供一个接口
+    // void CancelInactiveRelease() {
+    //     _loop->RunInLoop(std::bind(&Connection::CancelInactiveReleaseInLoop, this));
+    // }
+    // void Upgrade(const Any &context, const ConnectedCallback &conn, const MessageCallback &msg, 
 private:
     void HandleRead() {
-
+        // 1. 将TCP的内核接收缓冲区中的数据读取到用户层接收缓冲区
+        char buf[65536];
+        ssize_t sz = _socket.RecvNonBlock(buf, sizeof buf - 1);
+        if(sz < 0) {
+            // 读取出错，不能直接关闭连接
+            return ShutdownInLoop();
+        }
+        _in_buffer.Write(buf, sz);
+        // 2. 进行业务处理，调用用户指定的业务处理函数
+        if(_in_buffer.ReadableSize() > 0) {
+            // shared_from_this--从当前对象自身获取自身的shared_ptr管理对象
+            return _message_callback(shared_from_this(), &_in_buffer);
+        }
     }
+    // 连接的写事件就绪后的回调函数：将发送缓冲区中的数据进行发送即可
     void HandleWrite() {
-
+        ssize_t sz = _socket.SendNonBlock(_out_buffer.ReadPosition(), _out_buffer.ReadableSize());
+        if(sz < 0) {
+            // 发送失败，看看接收缓冲区中是否有数据，有就处理一下，没有就直接关闭喽
+            if(_in_buffer.ReadableSize() > 0) {
+                _message_callback(shared_from_this(), &_in_buffer);
+            }
+            return Release();  // 实际的关闭释放操作
+        }
+        // 发送成功
+        _out_buffer.MoveReadOffset(sz);  // 将发送缓冲区中已经发送出去的数据进行清理
+        if(_out_buffer.ReadableSize() == 0) {
+            // 发完了
+            _channel.DisableWrite(); // 关闭可写关心
+            if()
+        }
+        return ;
     }
+    // 描述符触发挂断事件之后的回调函数
     void HandleClose() {
-
+        // 此时连接已经挂断，接收缓冲区有数据就处理一下
+        if(_in_buffer.ReadableSize() > 0) {
+            if(_message_callback) {
+                _message_callback(shared_from_this(), &_in_buffer);
+            }   
+        }
+        return Release();
     }
+    // 描述符触发出错事件??
     void HandleError() {
-
+        return HandleClose();
     }
     void HandleEvent() {
-
+        if(_enable_inactive_release == true) {
+            // 需要刷新定时销毁任务
+        }
+        if(_any_event_callback) {
+            _any_event_callback(shared_from_this());
+        }
     }
+    void EstablishInLoop() {
+        // 从属Reactor线程执行这个，理解为连接建立的收尾工作~关键步骤~
+        assert(_loop->IsInLoop());
+        assert(_status == CONNECTING);
+        _channel.EnableRead();  // 使连接绑定的EventLoop里面的epoll关心读事件
+        _status = CONNECTED;
+        if(_connected_callback) _connected_callback(shared_from_this());
+    }
+    // 这个关闭操作并非实际的连接释放操作，需要判断还有没有数据待处理，待发送
+    // 比如数据读取出错调用这个
+    void ShutdownInLoop() {
+        _status = DISCONNECTING;// 设置连接为半关闭状态
+        if(_in_buffer.ReadableSize() > 0) {
+            if (_message_callback) {
+                _message_callback(shared_from_this(), &_in_buffer);
+            }
+        }
+        if(_out_buffer.ReadableSize() > 0) {
+
+        }
+        else {
+            // 没有数据未发送了
+            ReleaseInLoop();
+        }
+    }
+    void ReleaseInLoop() {
+        _status = DISCONNECTED;
+        _channel.RemoveFromEpoll();
+    }
+    void SendInLoop(Buffer &buf) {}
+    // void UpgradeInLoop(){} 
+    void EnableInactiveReleaseInLoop(int sec) {
+        // 比如连接建立时，_loop线程就要执行这个喽，去创建定时任务，如果功能开启的话~~
+        _enable_inactive_release = true;
+        // 按理来说这里不可能是已存在的
+        if(_loop->HasTimer(_conn_id)) {
+            // 定时任务已存在，刷新即可
+            return _loop->TimerRefresh(_conn_id);
+        }
+        _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::Release, this));
+    }
+    // 取消非活跃销毁???? 这有用?
+    // void CancelInactiveReleaseInLoop() {}
 };
 // Connection是对TCP通信套接字的同一管理，Acceptor是对listen套接字的统一管理
 class Acceptor
@@ -941,7 +1047,7 @@ public:
         _channel.EnableRead();
     }
 private:
-    // 主Reactor线程执行这个~
+    // 主Reactor线程会执行这个~
     void HandleRead() {
         int newfd = _listen_socket.Accept();
         if(newfd == -1) return ;
@@ -962,7 +1068,7 @@ private:
     int _timeout;
     bool _enable_inactive_release;
 
-    EventLoop _base_loop;    // 主Reactor线程
+    EventLoop _base_loop;    // 主Reactor线程执行_base_loop的Start
     Acceptor _acceptor;
     LoopThreadPool _pool;    // 从属Reactor线程池
     using PtrConnection = std::shared_ptr<Connection>;
@@ -974,6 +1080,7 @@ private:
     using ConnectedCallback = std::function<void (const PtrConnection &)>;
     using CloseCallback = std::function<void (const PtrConnection &)>;
     using AnyEventCallback = std::function<void (const PtrConnection &)>;
+    using Functor = std::function<void()>;    // 主线程的定时任务类型
     MessageCallback _message_callback = nullptr;
     ConnectedCallback _connected_callback = nullptr;
     CloseCallback _close_callback = nullptr;
@@ -992,7 +1099,7 @@ public:
     _pool(thread_num, &_base_loop) {
         // 先进行第一步，获取新连接之后才能分配到从属Reactor线程池中，再启动_base_loop对于listen套接字的读关心
         // 否则在获取新客户端连接之后，无法将新连接分配到从属Reactor线程池中，因为Acceptor的_accept_callback为空~
-        _acceptor.SetAcceptCallback(xxx);
+        _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
         _acceptor.Listen();    // 在base_loop中开启listen套接字的读事件关心
         if(timeout > 0) {
             _timeout = timeout;
@@ -1013,8 +1120,18 @@ public:
     void SetAnyEventCallback(const AnyEventCallback &cb) {
         _any_event_callback = cb;
     }
-    void AddTask() {
-
+    // 添加一个定时任务
+    void RunAfter(Functor func, int delay) {
+        ...
+    }
+    void RunAfterInLoop() {
+        ...
+    }
+    void RemoveConnection() {
+        ...
+    }
+    void RemoveConnectionInLoop() {
+        ...
     }
     void Start() {
         _base_loop.Start();
@@ -1023,23 +1140,21 @@ public:
         // 因为主Reactor线程还没开始，所以从属Reactor线程池是安全的~
     }
 private:
-    // 主Reactor线程获取新连接之后执行这个~
+    // 主Reactor线程获取新连接之后会执行这个~
     void NewConnection(int fd) {
         EventLoop *loop = _pool.GetLoopBalanced();
-        PtrConnection p(new Connection(loop, _conn_id, fd));
+        PtrConnection conn(new Connection(loop, _conn_id, fd));
         // User设定的业务处理函数，一定需要的
-        p->SetMessageCallback(_message_callback);
+        conn->SetMessageCallback(_message_callback);
         // 可有可无，但是如果User设定了，则需要设定
-        p->SetConnectedCallback(_connected_callback);
-        p->SetCloseCallback(_close_callback);
-        p->SetAnyEventCallback(_any_event_callback);
-        p->SetSvrCloseCallback(xxxxxx);
-        if(_enable_inactive_release) p->EnableInactiveRelease(_timeout);  // 非活跃连接超时自动销毁
-
+        conn->SetConnectedCallback(_connected_callback);
+        conn->SetCloseCallback(_close_callback);
+        conn->SetAnyEventCallback(_any_event_callback);
+        conn->SetSvrCloseCallback(xxxxxx);
+        if(_enable_inactive_release) conn->EnableInactiveRelease(_timeout);  // 非活跃连接超时自动销毁
         // 到此为止，新连接的事件监控还没有开启
-        
-        p->Establish();   // ?????
-        _conns.insert({_conn_id, p});
+        conn->Establish();
+        _conns.insert({_conn_id, conn});
         ++_conn_id;
     }
 };
