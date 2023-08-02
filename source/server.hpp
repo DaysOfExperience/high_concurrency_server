@@ -877,7 +877,7 @@ public:
     // 在Connection构造时，会设定状态为CONNECTING
     Connection(EventLoop *loop, uint64_t id, int sockfd):
         _conn_id(id), _timer_id(id), _sockfd(sockfd), _status(CONNECTING), _enable_inactive_release(false),
-        _loop(loop), _socket(_socket), _channel(_loop, _sockfd), _in_buffer(), _out_buffer() {
+        _loop(loop), _socket(_sockfd), _channel(_loop, _sockfd), _in_buffer(), _out_buffer() {
         _channel.SetReadCallback(std::bind(&Connection::HandleRead, this));
         _channel.SetWriteCallback(std::bind(&Connection::HandleWrite, this));
         _channel.SetCloseCallback(std::bind(&Connection::HandleClose, this));
