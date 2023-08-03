@@ -198,6 +198,7 @@ public:
     std::unordered_map<std::string, std::string> _headers;        // 头部字段
 public:
     HttpResponse() {}
+    HttpResponse(int status) {}
     void Reset() {
     }
     void SetHeader(const std::string &key, const std::string &value) {
@@ -233,6 +234,8 @@ typedef enum {
 class HttpContext
 {
 private:
+    // 在解析HttpRequest的过程中，可能出现各种错误情况，比如414; // URI TOO LONG  400;  //BAD REQUEST
+    // 所以，
     int _resp_status;             // 响应状态码
     HttpRecvStatus _recv_status;  // 当前接收并解析的阶段状态
     HttpRequest _request;         // 已经解析得到的Http请求信息
@@ -420,4 +423,54 @@ private:
             return true;
         }
     }
+};
+#define DEFALT_TIMEOUT 10
+class HttpServer
+{
+private:
+    TcpServer _server;
+public:
+    HttpServer(int port, int thread_num = 2, int timeout = DEFALT_TIMEOUT) :
+        _server(port, thread_num, timeout) {
+        // std::function<void (const PtrConnection &, Buffer *in_buffer)>
+        _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
+    }
+    // 实际上，当server的某通信TCP套接字读事件就绪时，会读对端发送的数据到Connection的_in_buffer中
+    // （对于Http server来说，就是一个http request字符串），我们需要进行业务处理，下方OnMessage方法就是业务处理方法
+    void OnMessage(const PtrConnection &conn, Buffer *in_buffer) {
+        // 1. 获取上下文
+        HttpContext *context = conn->GetContext()->get<HttpContext>();
+        // 2. 通过上下文对接收缓冲区中的数据进行解析，得到HttpRequest对象
+        context->RecvHttpRequest(in_buffer);
+        HttpRequest &req = context->Request();   // 当前解析出的Request
+        HttpResponse rsp(context->RespStatus());
+        //  2.1 如果缓冲区的数据解析出错，就直接回复出错响应
+        if (context->RespStatus() >= 400) {
+            //进行错误响应，关闭连接
+            ErrorHandler(req, &rsp);     //填充一个错误显示页面数据到rsp中
+            WriteReponse(conn, req, rsp);//组织响应发送给客户端
+            // 注意，此上下文实际上是存储在Connection的内部的，所以我们需要进行清理。但是，其实后面要关闭连接也就无所谓了其实
+            context->Reset();
+            in_buffer->MoveReadOffset(in_buffer->ReadableSize());//出错了就把缓冲区数据清空
+            conn->Shutdown();//关闭连接
+            return ;
+        }
+        if (context->RecvStatus() != RECV_HTTP_OVER) {
+            // 当前还没有解析出一个完成的http请求报文，等新数据到来再重新继续处理
+            return ;
+        }
+        //  2.2 如果解析正常，且请求已经获取完毕，才开始去进行处理
+        // 此时有了一个完整的Http请求了
+        // 3. 请求路由 + 业务处理
+        Route(req, &rsp);
+        // 4. 获取到一个Response，进行发送
+        WriteReponse(conn, req, rsp);
+        // 5. 重置上下文，以免对下次该连接的Http处理产生影响
+        context->Reset();
+        // 6. 根据长短连接判断是否关闭连接/继续处理
+        if (rsp.Close() == true) {
+            conn->Shutdown();  // 短链接则直接关闭
+        }
+    }
+    void Route(const )
 };
