@@ -1,5 +1,8 @@
 #include "../server.hpp"
 #include <regex>
+#include <fstream>
+#include <sys/stat.h>
+
 std::unordered_map<int, std::string> _status_msg = {
     {100,  "Continue"},
     {101,  "Switching Protocol"},
@@ -139,7 +142,170 @@ std::unordered_map<std::string, std::string> _mime_msg = {
 };
 class Util
 {
-
+public:
+    // 字符串切分函数: 将src字符串按照sep字符串进行切分，将切分获取的子串放入vec中，返回值为子串的数量
+    static size_t Split(const std::string src, const std::string sep, std::vector<std::string> *vec) {
+        // aaa=bbb&&&ccccc=ssss&sadasd=cascsad
+        size_t start_pos = 0;
+        while(start_pos < src.size()) {
+            size_t pos = src.find(sep, start_pos);
+            if(pos == std::string::npos) {
+                // 没有找到
+                vec->push_back(src.substr(start_pos));
+                return vec->size();
+            }
+            if(pos == start_pos) {
+                // 下一个字符串就是sep
+                start_pos += sep.size();
+                continue;
+            }
+            vec->push_back(src.substr(start_pos, pos));
+            start_pos = pos + sep.size();
+        }
+        // 只有当src为空串时才会执行这里~
+        return vec->size();   // 0
+    }
+    static bool ReadFile(const std::string file_path, std::string *dst_str) {
+        // 读取file_path文件内容到dst_str中
+        std::ifstream ifs(file_path, std::ios::binary);
+        if (ifs.is_open() == false) {
+            printf("OPEN %s FILE FAILED!!", file_path.c_str());
+            return false;
+        }
+        size_t fsize = 0;
+        ifs.seekg(0, ifs.end);  // 跳转读写位置到末尾
+        fsize = ifs.tellg();    // 获取当前读写位置相对于起始位置的偏移量，从末尾偏移刚好就是文件大小
+        ifs.seekg(0, ifs.beg);  // 跳转到起始位置
+        dst_str->resize(fsize); // 开辟文件大小的空间
+        ifs.read(&(*dst_str)[0], fsize);
+        if (ifs.good() == false) {
+            printf("READ %s lFILE FAILED!!", file_path.c_str());
+            ifs.close();
+            return false;
+        }
+        ifs.close();
+        return true;
+    }
+        // URL编码: 避免URL中资源路径和查询字符串中的特殊字符与HTTP请求中特殊字符产生歧义
+        // 编码格式：将特殊字符的ascii值，转换为两个16进制字符，前缀%   C++ -> C%2B%2B
+        // 不编码的特殊字符： RFC3986文档规定 . - _ ~ 字母，数字属于绝对不编码字符，其余字符需要编码
+        // RFC3986文档规定，编码格式 %HH 
+        // W3C标准中规定，查询字符串中的空格，需要编码为+， 解码则是+转空格。而资源路径中的空格按照%HH进行编码
+        static std::string UrlEncode(const std::string &url, bool space_to_plus) {
+            std::string ret;
+            for(auto & c : url) {
+                if(c == '.' || c == '-' || c == '_' || c == '~' || isalnum(c)) {
+                    ret += c;
+                    continue;
+                }
+                if(c == ' ' && space_to_plus) {
+                    ret += '+';
+                    continue;
+                }
+                // 其余字符均需要Encode为%HH
+                char arr[4] = {0};
+                snprintf(arr, 4, "%%%02X", c);
+                ret += arr;
+            }
+            return ret;
+        }
+        static std::string UrlDecode(const std::string &url, bool plus_to_space) {
+            // 解码，遇到%，将其后的两个字符转为整数，第一个整数*16+第二个整数，就是转换后的字符的ASCII码
+            std::string ret;
+            for(size_t i = 0; i < url.size(); ++i) {
+                if(url[i] == '+' && plus_to_space) {
+                    ret += ' ';
+                    continue;
+                }
+                // if(url[i] == '.' || url[i] == '-' || url[i] == '_' || url[i] == '~' || isalnum(url[i])) {
+                //     // 这是不需要解码的
+                //     ret += url[i];
+                // }
+                if(url[i] == '%' && i + 2 < url.size()) {
+                    int c1 = HexToI(url[i+1]);
+                    int c2 = HexToI(url[i+2]);
+                    char c = c1 * 16 + c2;
+                    ret += c;
+                    i += 2;
+                    continue;
+                }
+                ret += url[i];
+            }
+            return ret;
+        }
+        static int HexToI(char c) {
+            // 0 1 8 9 A B E F
+            if(c >= '0' && c <= '9') {
+                return c - '0';
+            }
+            if(c >= 'A' && c <= 'F') {
+                return c - 'A' + 10;
+            }
+            if(c >= 'a' && c <= 'f') {
+                return c - 'a' + 10;
+            }
+            return -1;
+        }
+        // 响应状态码到状态码描述的转换
+        static std::string StatusToDesc(int status) {
+            auto it = _status_msg.find(status);
+            if(it == _status_msg.end()) {
+                return "UnKnow";
+            }
+            return it->second;
+        }
+        static std::string Mime(const std::string &file_path) {
+            auto pos = file_path.rfind('.');
+            if (pos == std::string::npos) {
+                return "application/octet-stream";   // 没有扩展名，文件类型是一个二进制文件
+            }
+            // 有扩展名，根据扩展名获取MIME
+            auto it = _mime_msg.find(file_path.substr(pos));
+            if(it == _mime_msg.end()) {
+                return "application/octet-stream"; // 没有扩展名对应的mime，则视为二进制文件
+            }
+            return it->second;  // 迭代器是一个指针~~
+        }
+        // 判断一个文件是否是一个目录
+        static bool IsDirectory(const std::string &file) {
+            struct stat st;
+            int ret = stat(file.c_str(), &st);
+            if (ret < 0) {
+                return false;
+            }
+            return S_ISDIR(st.st_mode);
+            
+        }
+        // 判断一个文件是否是一个普通文件
+        static bool IsRegular(const std::string &file) {
+            struct stat st;
+            int ret = stat(file.c_str(), &st);
+            if (ret < 0) {
+                return false;
+            }
+            return S_ISREG(st.st_mode);
+        }
+        // http请求的资源路径有效性判断
+        // /index.html  --- 前边的/叫做相对根目录  映射的是服务器上的某个子目录
+        // 客户端只能请求相对根目录内的资源，其他地方的资源都不予理会
+        // /../login, 这个路径中的..会让路径的查找跑到相对根目录之外，这是不合理的，不安全的
+        static bool ValidPath(const std::string &path) {
+            std::vector<std::string> sub_path;
+            Split(path, "/", &sub_path);
+            int cur_level = 0;
+            for(auto & sub : sub_path) {
+                if(sub == "..") {
+                    cur_level--;
+                    if(cur_level < 0) {
+                        // 危!!!!
+                        return false;
+                    }
+                    continue;
+                }
+                cur_level++;
+            }
+            return true;
+        }
 };
 
 class HttpRequest
@@ -355,7 +521,7 @@ private:
         // 请求方法可能为小写，需要进行转换
         std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
         // 资源路径，需要进行URL解码!!!
-        _request._path = Util::UrlDecode(matches[2], false);
+        _request._path = Util::UrlDecode(matches[2], false);  // 资源路径的空格不转换为+
         // 协议版本
         _request._version = matches[4];
         // 查询字符串的获取与处理  matches[3]
@@ -371,8 +537,8 @@ private:
                 _resp_status = 400;//BAD REQUEST
                 return false;
             }
-            auto left = Util::UrlDecode(s.substr(0, pos), true);
-            auto right = Util::UrlDecode(s.substr(pos + 1), true);
+            auto left = Util::UrlDecode(s.substr(0, pos), true);    // 查询字符串的空格进行编码时，需要转换为+
+            auto right = Util::UrlDecode(s.substr(pos + 1), true);  // 查询字符串的空格进行编码时，需要转换为+
             _request.SetQueryString(left, right);   // 一个查询字符串提取出来了
         }
         return true;
@@ -505,7 +671,7 @@ private:
         // 3. 请求路由 + 业务处理
         Route(req, &rsp);
         // 4. 获取到一个Response，进行发送
-        WriteReponse(conn, req, rsp);
+        WriteResponse(conn, req, rsp);
         // 5. 重置上下文，以免对下次该连接的Http处理产生影响
         context->Reset();
         // 6. 根据长短连接判断是否关闭连接/继续处理
@@ -531,7 +697,7 @@ private:
         }
         //2. 将rsp中的要素，按照http协议格式进行组织
         std::stringstream rsp_str;
-        rsp_str << req._version << " " << std::to_string(rsp._statu) << " " << Util::StatuDesc(rsp._statu) << "\r\n";
+        rsp_str << req._version << " " << std::to_string(rsp._status) << " " << Util::StatusToDesc(rsp._status) << "\r\n";
         for (auto &head : rsp._headers) {
             rsp_str << head.first << ": " << head.second << "\r\n";
         }
@@ -599,7 +765,7 @@ private:
         }
         // req_path即需要访问的静态资源
         Util::ReadFile(req_path, &rsp->_body);   // Response的正文好了
-        rsp->SetHeader("Content-Type", Util::ExtMime(req_path));  // Response的mime好了
+        rsp->SetHeader("Content-Type", Util::Mime(req_path));  // Response的mime好了
     }
     void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers &handlers) {
         // 在对应请求方法的路由表中，查找是否含有对应资源请求的处理函数，有则调用，没有则返回404
