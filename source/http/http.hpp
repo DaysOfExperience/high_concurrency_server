@@ -1,6 +1,6 @@
 #include "../server.hpp"
 #include <regex>
-std::unordered_map<int, std::string> _statu_msg = {
+std::unordered_map<int, std::string> _status_msg = {
     {100,  "Continue"},
     {101,  "Switching Protocol"},
     {102,  "Processing"},
@@ -149,24 +149,44 @@ public:
     std::string _path;     // 资源路径
     std::string _version;  // 协议版本
     std::string _body;     // 请求正文
-
+    std::smatch _matches;     // 资源路径的正则提取数据
     std::unordered_map<std::string, std::string> _headers;        // 头部字段
     std::unordered_map<std::string, std::string> _query_string;   // 查询字符串
 public:
     HttpRequest() {}
-    void Reset() {
-    }
+    // void Reset() {
+    // }
     void SetHeader(const std::string &key, const std::string &value) {
+        _headers.insert({key, value});
     }
     bool HasHeader(const std::string &key) {
+        if(_headers.find(key) == _headers.end()) {
+            return false;
+        }
+        return true;
     }
     std::string GetHeader(const std::string &key) {
+        auto it = _headers.find(key);
+        if(it == _headers.end()) {
+            return "";
+        }
+        return it->second;
     }
     void SetQueryString(const std::string &key, const std::string &value) {
+        _query_string.insert(std::make_pair(key, value));
     }
     bool HasQueryString(const std::string &key) {
+        if(_query_string.find(key) == _query_string.end()) {
+            return false;
+        }
+        return true;
     }
     std::string GetQueryString(const std::string &key) {
+        auto it = _query_string.find(key);
+        if(it == _query_string.end()) {
+            return "";
+        }
+        return it->second;
     }
     // 获取HTTP请求的正文长度~
     size_t ContentLength() {
@@ -176,8 +196,8 @@ public:
         return std::stoul(_headers["content-length"]);   // yzl~~
     }
     // 判断是否是短连接
-    bool Close() {
-    }
+    // bool Close() {
+    // }
 };
 // 媒体类型（通常称为 Multipurpose Internet Mail Extensions 或 MIME 类型）是一种标准，用来表示文档、文件或字节流的性
 // 质和格式。它在IETF RFC 6838中进行了定义和标准化。
@@ -198,25 +218,36 @@ public:
     std::unordered_map<std::string, std::string> _headers;        // 头部字段
 public:
     HttpResponse() {}
-    HttpResponse(int status) {}
+    HttpResponse(int status) : _status(status) {
+    }
     void Reset() {
     }
     void SetHeader(const std::string &key, const std::string &value) {
+        _headers.insert({key, value});
     }
     bool HasHeader(const std::string &key) {
+        if(_headers.find(key) == _headers.end()) {
+            return false;
+        }
+        return true;
     }
     std::string GetHeader(const std::string &key) {
+        auto it = _headers.find(key);
+        if(it == _headers.end()) {
+            return "";
+        }
+        return it->second;
     }
-    // 设置正文，以及正文类型（设置在HTTP响应header中）
-    void SetContent(const std::string &body, const std::string &type = "text/html") {
+    // // 设置正文，以及正文类型（设置在HTTP响应header中）
+    // void SetContent(const std::string &body, const std::string &type = "text/html") {
 
-    }
-    void SetRedirect(const std::string &url, int status = 302) {
+    // }
+    // void SetRedirect(const std::string &url, int status = 302) {
 
-    }
-    // 判断是否是短连接
-    bool Close() {
-    }
+    // }
+    // // 判断是否是短连接
+    // bool Close() {
+    // }
 };
 // 因为TCP面向字节流，因此在接收缓冲区中的HTTP请求可能不足一个完成的报文
 // 因此我们需要按照HTTP的格式解析已经收到的HTTP请求报文（可能是一部分），若只解析了一部分，比如请求头
@@ -230,13 +261,15 @@ typedef enum {
     RECV_HTTP_OVER    // 接收并解析完毕
 }HttpRecvStatus;
 
+// 在Connection类中有一个上下文字段，类型为Any，用于解析客户端发来的应用层报文
+// 若应用层协议为HTTP协议，则该Any类型的上下文字段就应该存储HttpContext类型对象
 #define MAX_LINE 8192
 class HttpContext
 {
 private:
     // 在解析HttpRequest的过程中，可能出现各种错误情况，比如414; // URI TOO LONG  400;  //BAD REQUEST
     // 所以，
-    int _resp_status;             // 响应状态码
+    int _resp_status;             // Response响应状态码
     HttpRecvStatus _recv_status;  // 当前接收并解析的阶段状态
     HttpRequest _request;         // 已经解析得到的Http请求信息
 public:
@@ -255,7 +288,7 @@ public:
     }
     // Buffer? : void OnMessage(const PtrConnection &conn, Buffer *buffer)
     //           业务处理函数，是当将内核TCP接收缓冲区读取到应用层_in_buffer中后
-    //           进行业务处理，需要从中解析出HTTP request，因此，参数是Buffer
+    //           进行业务处理时，首先需要从_in_buffer中解析出HTTP request，因此，参数是Buffer *
     // 对接收缓冲区中的http字符串进行解析
     void RecvHttpRequest(Buffer *buffer) {
         switch(_recv_status) {
@@ -302,7 +335,7 @@ private:
         return true;
     }
     bool ParseHttpLine(const std::string line) {
-        // line 为一个HTTP request的请求头，需要将其进行解析，放入_request中
+        // line 为一个HTTP request的请求行，需要将其进行解析，放入_request中
         std::smatch matches;
         std::regex e("(GET|HEAD|POST|PUT|DELETE) ([^?]*)(?:\\?(.*))? (HTTP/1\\.[01])(?:\n|\r\n)?", std::regex::icase);
         bool ret = std::regex_match(line, matches, e);
@@ -428,28 +461,36 @@ private:
 class HttpServer
 {
 private:
+    using Handler = std::function<void(const HttpRequest &, HttpResponse *)>;
+    using Handlers = std::vector<std::pair<std::regex, Handler>>;  // /numbers/(\d+) : 回调方法
+    Handlers _get_route;
+    Handlers _post_route;
+    Handlers _put_route;
+    Handlers _delete_route;
     TcpServer _server;
+    std::string _basedir;    // 静态资源根目录
 public:
     HttpServer(int port, int thread_num = 2, int timeout = DEFALT_TIMEOUT) :
         _server(port, thread_num, timeout) {
         // std::function<void (const PtrConnection &, Buffer *in_buffer)>
         _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
     }
+private:
     // 实际上，当server的某通信TCP套接字读事件就绪时，会读对端发送的数据到Connection的_in_buffer中
     // （对于Http server来说，就是一个http request字符串），我们需要进行业务处理，下方OnMessage方法就是业务处理方法
     void OnMessage(const PtrConnection &conn, Buffer *in_buffer) {
-        // 1. 获取上下文
+        // 1. 获取上下文，指针指向Connection的_context字段
         HttpContext *context = conn->GetContext()->get<HttpContext>();
         // 2. 通过上下文对接收缓冲区中的数据进行解析，得到HttpRequest对象
         context->RecvHttpRequest(in_buffer);
         HttpRequest &req = context->Request();   // 当前解析出的Request
-        HttpResponse rsp(context->RespStatus());
+        HttpResponse rsp(context->RespStatus()); // 进行响应的Response，目前只有_status状态码字段被设置了
         //  2.1 如果缓冲区的数据解析出错，就直接回复出错响应
         if (context->RespStatus() >= 400) {
             //进行错误响应，关闭连接
             ErrorHandler(req, &rsp);     //填充一个错误显示页面数据到rsp中
-            WriteReponse(conn, req, rsp);//组织响应发送给客户端
-            // 注意，此上下文实际上是存储在Connection的内部的，所以我们需要进行清理。但是，其实后面要关闭连接也就无所谓了其实
+            WriteResponse(conn, req, rsp);//组织响应发送给客户端
+            // 注意，此上下文实际上是存储在Connection的内部的，所以我们需要进行清理。但是，后面要关闭连接，也就无所谓了其实
             context->Reset();
             in_buffer->MoveReadOffset(in_buffer->ReadableSize());//出错了就把缓冲区数据清空
             conn->Shutdown();//关闭连接
@@ -472,5 +513,108 @@ public:
             conn->Shutdown();  // 短链接则直接关闭
         }
     }
-    void Route(const )
+    void WriteResponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
+        //1. 先完善头部字段
+        if (req.Close() == true) {
+            rsp.SetHeader("Connection", "close");
+        }else {
+            rsp.SetHeader("Connection", "keep-alive");
+        }
+        if (rsp._body.empty() == false && rsp.HasHeader("Content-Length") == false) {
+            rsp.SetHeader("Content-Length", std::to_string(rsp._body.size()));
+        }
+        if (rsp._body.empty() == false && rsp.HasHeader("Content-Type") == false) {
+            rsp.SetHeader("Content-Type", "application/octet-stream");
+        }
+        if (rsp._redirect_flag == true) {
+            rsp.SetHeader("Location", rsp._redirect_url);
+        }
+        //2. 将rsp中的要素，按照http协议格式进行组织
+        std::stringstream rsp_str;
+        rsp_str << req._version << " " << std::to_string(rsp._statu) << " " << Util::StatuDesc(rsp._statu) << "\r\n";
+        for (auto &head : rsp._headers) {
+            rsp_str << head.first << ": " << head.second << "\r\n";
+        }
+        rsp_str << "\r\n";
+        rsp_str << rsp._body;
+        // 进行发送
+        conn->Send(rsp_str.str().c_str(), rsp_str.str().size());
+    }
+    // DisPatcher中会对Request进行进行修改：_matches
+    void Route(HttpRequest &req, HttpResponse *rsp) {
+        // 对请求进行分辨，是一个静态资源请求，还是一个功能性请求
+        // 静态资源请求，则进行静态资源的处理
+        // 功能性请求，则需要通过几个请求路由表来确定是否有处理函数
+        // 既不是静态资源请求，也没有设置对应的功能性请求处理函数，就返回405
+
+        // 判断是否是在请求一个合理的存在的静态资源，若是，则进行读取静态资源
+        if(IsFileHandler(req) == true) {
+            // 此时，是在请求一个静态资源，且静态资源存在，且合法，且有静态资源根目录....
+            // 进行读取静态资源到HttpResponse的正文中？
+            FileHandler(req, rsp);
+        }
+        // 请求的不是静态资源
+        if (req._method == "GET" || req._method == "HEAD") {
+            return Dispatcher(req, rsp, _get_route);
+        }else if (req._method == "POST") {
+            return Dispatcher(req, rsp, _post_route);
+        }else if (req._method == "PUT") {
+            return Dispatcher(req, rsp, _put_route);
+        }else if (req._method == "DELETE") {
+            return Dispatcher(req, rsp, _delete_route);
+        }
+    }
+    bool IsFileHandler(const HttpRequest &req) {
+        // 1. HttpServer设置了静态资源根目录，才有可能访问到静态资源
+        if (_basedir.empty()) {
+            return false;
+        }
+        // 2. 请求方法，必须是GET / HEAD请求方法
+        if (req._method != "GET" && req._method != "HEAD") {
+            return false;
+        }
+        // 3. 请求的资源路径必须是一个合法路径
+        if (Util::ValidPath(req._path) == false) {
+            return false;
+        }
+        // 4. 请求的资源必须存在,且是一个普通文件
+        // (有一种请求比较特殊 -- 目录：/, /image/， 这种情况给后边默认追加一个 index.html)
+        // index.html    /image/a.png
+        // 不要忘了前缀的相对根目录,也就是将请求路径转换为实际存在的路径  /image/a.png  ->   ./wwwroot/image/a.png
+        std::string req_path = _basedir + req._path; // 为了避免直接修改请求的资源路径，因此定义一个临时对象
+        if (req._path.back() == '/')  {
+            req_path += "index.html";
+        }
+        if (Util::IsRegular(req_path) == false) {
+            return false;
+        }
+        return true;
+    }
+    // 静态资源的请求处理 --- 将静态资源文件的数据读取出来，放到rsp的_body中, 并设置mime
+    void FileHandler(const HttpRequest &req, HttpResponse *rsp) {
+        // 此时的req._path依旧可能为一个"/"，且没有添加前缀的相对根目录路径，需要我们处理一下
+        std::string req_path = _basedir + req._path;
+        if(req._path.back() == '/') {
+            req_path += "index.html";
+        }
+        // req_path即需要访问的静态资源
+        Util::ReadFile(req_path, &rsp->_body);   // Response的正文好了
+        rsp->SetHeader("Content-Type", Util::ExtMime(req_path));  // Response的mime好了
+    }
+    void Dispatcher(HttpRequest &req, HttpResponse *rsp, Handlers &handlers) {
+        // 在对应请求方法的路由表中，查找是否含有对应资源请求的处理函数，有则调用，没有则返回404
+        // 思想：路由表存储的是键值对 -- 正则表达式 : 处理函数
+        // 使用正则表达式，对请求的资源路径进行正则匹配，匹配成功就使用对应函数进行处理
+        // 路由表中存储的是：/numbers/(\d+)      而Request的_path存储的是：/numbers/12345
+        for (auto &handler : handlers) {
+            const std::regex &re = handler.first;
+            const Handler &functor = handler.second;
+            bool ret = std::regex_match(req._path, req._matches, re);
+            if (ret == false) {
+                continue;  // 匹配失败，请求的不是这个资源
+            }
+            return functor(req, rsp); // 传入请求信息，和空的rsp，执行处理函数
+        }
+        rsp->_status = 404;   // Not Found
+    }
 };
