@@ -186,126 +186,142 @@ public:
         ifs.close();
         return true;
     }
-        // URL编码: 避免URL中资源路径和查询字符串中的特殊字符与HTTP请求中特殊字符产生歧义
-        // 编码格式：将特殊字符的ascii值，转换为两个16进制字符，前缀%   C++ -> C%2B%2B
-        // 不编码的特殊字符： RFC3986文档规定 . - _ ~ 字母，数字属于绝对不编码字符，其余字符需要编码
-        // RFC3986文档规定，编码格式 %HH 
-        // W3C标准中规定，查询字符串中的空格，需要编码为+， 解码则是+转空格。而资源路径中的空格按照%HH进行编码
-        static std::string UrlEncode(const std::string &url, bool space_to_plus) {
-            std::string ret;
-            for(auto & c : url) {
-                if(c == '.' || c == '-' || c == '_' || c == '~' || isalnum(c)) {
-                    ret += c;
-                    continue;
+    //向文件写入数据
+    static bool WriteFile(const std::string &filename, const std::string &buf) {
+        std::ofstream ofs(filename, std::ios::binary | std::ios::trunc);
+        if (ofs.is_open() == false) {
+            printf("OPEN %s FILE FAILED!!", filename.c_str());
+            return false;
+        }
+        ofs.write(buf.c_str(), buf.size());
+        if (ofs.good() == false) {
+            ERR_LOG("WRITE %s FILE FAILED!", filename.c_str());
+            ofs.close();    
+            return false;
+        }
+        ofs.close();
+        return true;
+    }
+    // URL编码: 避免URL中资源路径和查询字符串中的特殊字符与HTTP请求中特殊字符产生歧义
+    // 编码格式：将特殊字符的ascii值，转换为两个16进制字符，前缀%   C++ -> C%2B%2B
+    // 不编码的特殊字符： RFC3986文档规定 . - _ ~ 字母，数字属于绝对不编码字符，其余字符需要编码
+    // RFC3986文档规定，编码格式 %HH 
+    // W3C标准中规定，查询字符串中的空格，需要编码为+， 解码则是+转空格。而资源路径中的空格按照%HH进行编码
+    static std::string UrlEncode(const std::string &url, bool space_to_plus) {
+        std::string ret;
+        for(auto & c : url) {
+            if(c == '.' || c == '-' || c == '_' || c == '~' || isalnum(c)) {
+                ret += c;
+                continue;
+            }
+            if(c == ' ' && space_to_plus) {
+                ret += '+';
+                continue;
+            }
+            // 其余字符均需要Encode为%HH
+            char arr[4] = {0};
+            snprintf(arr, 4, "%%%02X", c);
+            ret += arr;
+        }
+        return ret;
+    }
+    static std::string UrlDecode(const std::string &url, bool plus_to_space) {
+        // 解码，遇到%，将其后的两个字符转为整数，第一个整数*16+第二个整数，就是转换后的字符的ASCII码
+        std::string ret;
+        for(size_t i = 0; i < url.size(); ++i) {
+            if(url[i] == '+' && plus_to_space) {
+                ret += ' ';
+                continue;
+            }
+            // if(url[i] == '.' || url[i] == '-' || url[i] == '_' || url[i] == '~' || isalnum(url[i])) {
+            //     // 这是不需要解码的
+            //     ret += url[i];
+            // }
+            if(url[i] == '%' && i + 2 < url.size()) {
+                int c1 = HexToI(url[i+1]);
+                int c2 = HexToI(url[i+2]);
+                char c = c1 * 16 + c2;
+                ret += c;
+                i += 2;
+                continue;
+            }
+            ret += url[i];
+        }
+        return ret;
+    }
+    static int HexToI(char c) {
+        // 0 1 8 9 A B E F
+        if(c >= '0' && c <= '9') {
+            return c - '0';
+        }
+        if(c >= 'A' && c <= 'F') {
+            return c - 'A' + 10;
+        }
+        if(c >= 'a' && c <= 'f') {
+            return c - 'a' + 10;
+        }
+        return -1;
+    }
+    // 响应状态码到状态码描述的转换
+    static std::string StatusToDesc(int status) {
+        auto it = _status_msg.find(status);
+        if(it == _status_msg.end()) {
+            return "UnKnow";
+        }
+        return it->second;
+    }
+    static std::string Mime(const std::string &file_path) {
+        auto pos = file_path.rfind('.');
+        if (pos == std::string::npos) {
+            return "application/octet-stream";   // 没有扩展名，文件类型是一个二进制文件
+        }
+        // 有扩展名，根据扩展名获取MIME
+        auto it = _mime_msg.find(file_path.substr(pos));
+        if(it == _mime_msg.end()) {
+            return "application/octet-stream"; // 没有扩展名对应的mime，则视为二进制文件
+        }
+        return it->second;  // 迭代器是一个指针~~
+    }
+    // 判断一个文件是否是一个目录
+    static bool IsDirectory(const std::string &file) {
+        struct stat st;
+        int ret = stat(file.c_str(), &st);
+        if (ret < 0) {
+            return false;
+        }
+        return S_ISDIR(st.st_mode);
+        
+    }
+    // 判断一个文件是否是一个普通文件
+    static bool IsRegular(const std::string &file) {
+        struct stat st;
+        int ret = stat(file.c_str(), &st);
+        if (ret < 0) {
+            return false;
+        }
+        return S_ISREG(st.st_mode);
+    }
+    // http请求的资源路径有效性判断
+    // /index.html  --- 前边的/叫做相对根目录  映射的是服务器上的某个子目录
+    // 客户端只能请求相对根目录内的资源，其他地方的资源都不予理会
+    // /../login, 这个路径中的..会让路径的查找跑到相对根目录之外，这是不合理的，不安全的
+    static bool ValidPath(const std::string &path) {
+        std::vector<std::string> sub_path;
+        Split(path, "/", &sub_path);
+        int cur_level = 0;
+        for(auto & sub : sub_path) {
+            if(sub == "..") {
+                cur_level--;
+                if(cur_level < 0) {
+                    // 危!!!!
+                    return false;
                 }
-                if(c == ' ' && space_to_plus) {
-                    ret += '+';
-                    continue;
-                }
-                // 其余字符均需要Encode为%HH
-                char arr[4] = {0};
-                snprintf(arr, 4, "%%%02X", c);
-                ret += arr;
+                continue;
             }
-            return ret;
+            cur_level++;
         }
-        static std::string UrlDecode(const std::string &url, bool plus_to_space) {
-            // 解码，遇到%，将其后的两个字符转为整数，第一个整数*16+第二个整数，就是转换后的字符的ASCII码
-            std::string ret;
-            for(size_t i = 0; i < url.size(); ++i) {
-                if(url[i] == '+' && plus_to_space) {
-                    ret += ' ';
-                    continue;
-                }
-                // if(url[i] == '.' || url[i] == '-' || url[i] == '_' || url[i] == '~' || isalnum(url[i])) {
-                //     // 这是不需要解码的
-                //     ret += url[i];
-                // }
-                if(url[i] == '%' && i + 2 < url.size()) {
-                    int c1 = HexToI(url[i+1]);
-                    int c2 = HexToI(url[i+2]);
-                    char c = c1 * 16 + c2;
-                    ret += c;
-                    i += 2;
-                    continue;
-                }
-                ret += url[i];
-            }
-            return ret;
-        }
-        static int HexToI(char c) {
-            // 0 1 8 9 A B E F
-            if(c >= '0' && c <= '9') {
-                return c - '0';
-            }
-            if(c >= 'A' && c <= 'F') {
-                return c - 'A' + 10;
-            }
-            if(c >= 'a' && c <= 'f') {
-                return c - 'a' + 10;
-            }
-            return -1;
-        }
-        // 响应状态码到状态码描述的转换
-        static std::string StatusToDesc(int status) {
-            auto it = _status_msg.find(status);
-            if(it == _status_msg.end()) {
-                return "UnKnow";
-            }
-            return it->second;
-        }
-        static std::string Mime(const std::string &file_path) {
-            auto pos = file_path.rfind('.');
-            if (pos == std::string::npos) {
-                return "application/octet-stream";   // 没有扩展名，文件类型是一个二进制文件
-            }
-            // 有扩展名，根据扩展名获取MIME
-            auto it = _mime_msg.find(file_path.substr(pos));
-            if(it == _mime_msg.end()) {
-                return "application/octet-stream"; // 没有扩展名对应的mime，则视为二进制文件
-            }
-            return it->second;  // 迭代器是一个指针~~
-        }
-        // 判断一个文件是否是一个目录
-        static bool IsDirectory(const std::string &file) {
-            struct stat st;
-            int ret = stat(file.c_str(), &st);
-            if (ret < 0) {
-                return false;
-            }
-            return S_ISDIR(st.st_mode);
-            
-        }
-        // 判断一个文件是否是一个普通文件
-        static bool IsRegular(const std::string &file) {
-            struct stat st;
-            int ret = stat(file.c_str(), &st);
-            if (ret < 0) {
-                return false;
-            }
-            return S_ISREG(st.st_mode);
-        }
-        // http请求的资源路径有效性判断
-        // /index.html  --- 前边的/叫做相对根目录  映射的是服务器上的某个子目录
-        // 客户端只能请求相对根目录内的资源，其他地方的资源都不予理会
-        // /../login, 这个路径中的..会让路径的查找跑到相对根目录之外，这是不合理的，不安全的
-        static bool ValidPath(const std::string &path) {
-            std::vector<std::string> sub_path;
-            Split(path, "/", &sub_path);
-            int cur_level = 0;
-            for(auto & sub : sub_path) {
-                if(sub == "..") {
-                    cur_level--;
-                    if(cur_level < 0) {
-                        // 危!!!!
-                        return false;
-                    }
-                    continue;
-                }
-                cur_level++;
-            }
-            return true;
-        }
+        return true;
+    }
 };
 
 class HttpRequest
@@ -319,7 +335,87 @@ public:
     std::unordered_map<std::string, std::string> _headers;        // 头部字段
     std::unordered_map<std::string, std::string> _query_string;   // 查询字符串
 public:
-    HttpRequest() {}
+    HttpRequest(): _version("HTTP/1.1") {
+    }
+    void Reset() {
+        _method.clear();
+        _path.clear();
+        _version = "HTTP/1.1";
+        _body.clear();
+        std::smatch tmp;
+        _matches.swap(tmp);
+        _headers.clear();
+        _query_string.clear();
+    }
+    void SetHeader(const std::string &key, const std::string &value) {
+        _headers.insert({key, value});
+    }
+    bool HasHeader(const std::string &key) const {
+        if(_headers.find(key) == _headers.end()) {
+            return false;
+        }
+        return true;
+    }
+    std::string GetHeader(const std::string &key) const {
+        auto it = _headers.find(key);
+        if(it == _headers.end()) {
+            return "";
+        }
+        return it->second;
+    }
+    void SetQueryString(const std::string &key, const std::string &value) {
+        _query_string.insert(std::make_pair(key, value));
+    }
+    bool HasQueryString(const std::string &key) const {
+        if(_query_string.find(key) == _query_string.end()) {
+            return false;
+        }
+        return true;
+    }
+    std::string GetQueryString(const std::string &key) const {
+        auto it = _query_string.find(key);
+        if(it == _query_string.end()) {
+            return "";
+        }
+        return it->second;
+    }
+    // 获取HTTP请求的正文长度~
+    size_t ContentLength() const {
+        if(_headers.find("content-length") == _headers.end()) {   // 其实有接口了，也就是HasHeader = =
+            return 0;
+        }
+        return std::stoul(_headers.find("content-length")->second);   // yzl~~其实有GetHander了
+    }
+    // 判断是否是短连接?
+    bool Close() const {
+        // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
+        if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
+            return false;
+        }
+        return true;
+    }
+};
+// 媒体类型（通常称为 Multipurpose Internet Mail Extensions 或 MIME 类型）是一种标准，用来表示文档、文件或字节流的性
+// 质和格式。它在IETF RFC 6838中进行了定义和标准化。
+
+// 互联网号码分配机构（IANA）是负责跟踪所有官方 MIME 类型的官方机构，您可以在媒体类型页面中找到最新的完整列表。
+
+// 警告： 浏览器通常使用 MIME 类型（而不是文件扩展名）来确定如何处理 URL，因此 Web 服务器在响应头中添加正确的
+// MIME 类型非常重要。如果配置不正确，浏览器可能会曲解文件内容，网站将无法正常工作，并且下载的文件也会被错误处理。
+class HttpResponse
+{
+public:
+    // std::string _version;       // 协议版本  不需要，到时候直接设置为HttpRequest的协议版本即可
+    int _status;                // 状态码
+    // std::string _status_desc;   // 状态码描述  不需要，根据状态码，按照Util里的方法直接获取状态码描述即可
+    std::string _body;          // 请求正文
+    bool _redirect_flag;        // 是否重定向
+    std::string _redirect_url;  // 重定向URL(统一资源定位器)
+    std::unordered_map<std::string, std::string> _headers;        // 头部字段
+public:
+    HttpResponse():_status(200), _redirect_flag(false) {}
+    HttpResponse(int status) : _status(status), _redirect_flag(false) {
+    }
     // void Reset() {
     // }
     void SetHeader(const std::string &key, const std::string &value) {
@@ -338,82 +434,22 @@ public:
         }
         return it->second;
     }
-    void SetQueryString(const std::string &key, const std::string &value) {
-        _query_string.insert(std::make_pair(key, value));
+    // 设置正文，以及正文类型（设置在HTTP响应header中）(在构建一个错误页面时需要)
+    void SetContent(const std::string &body, const std::string &type = "text/html") {
+        _body = body;
+        SetHeader("Content-Type", type);
     }
-    bool HasQueryString(const std::string &key) {
-        if(_query_string.find(key) == _query_string.end()) {
-            return false;
-        }
-        return true;
-    }
-    std::string GetQueryString(const std::string &key) {
-        auto it = _query_string.find(key);
-        if(it == _query_string.end()) {
-            return "";
-        }
-        return it->second;
-    }
-    // 获取HTTP请求的正文长度~
-    size_t ContentLength() {
-        if(_headers.find("content-length") == _headers.end()) {   // 其实有接口了，也就是HasHeader = =
-            return 0;
-        }
-        return std::stoul(_headers["content-length"]);   // yzl~~
-    }
-    // 判断是否是短连接
-    // bool Close() {
-    // }
-};
-// 媒体类型（通常称为 Multipurpose Internet Mail Extensions 或 MIME 类型）是一种标准，用来表示文档、文件或字节流的性
-// 质和格式。它在IETF RFC 6838中进行了定义和标准化。
-
-// 互联网号码分配机构（IANA）是负责跟踪所有官方 MIME 类型的官方机构，您可以在媒体类型页面中找到最新的完整列表。
-
-// 警告： 浏览器通常使用 MIME 类型（而不是文件扩展名）来确定如何处理 URL，因此 Web 服务器在响应头中添加正确的
-// MIME 类型非常重要。如果配置不正确，浏览器可能会曲解文件内容，网站将无法正常工作，并且下载的文件也会被错误处理。
-class HttpResponse
-{
-public:
-    std::string _version;       // 协议版本
-    int _status;                // 状态码
-    std::string _status_desc;   // 状态码描述
-    std::string _body;          // 请求正文
-    bool _redirect_flag;        // 是否重定向
-    std::string _redirect_url;  // 重定向URL(统一资源定位器)
-    std::unordered_map<std::string, std::string> _headers;        // 头部字段
-public:
-    HttpResponse() {}
-    HttpResponse(int status) : _status(status) {
-    }
-    void Reset() {
-    }
-    void SetHeader(const std::string &key, const std::string &value) {
-        _headers.insert({key, value});
-    }
-    bool HasHeader(const std::string &key) {
-        if(_headers.find(key) == _headers.end()) {
-            return false;
-        }
-        return true;
-    }
-    std::string GetHeader(const std::string &key) {
-        auto it = _headers.find(key);
-        if(it == _headers.end()) {
-            return "";
-        }
-        return it->second;
-    }
-    // // 设置正文，以及正文类型（设置在HTTP响应header中）
-    // void SetContent(const std::string &body, const std::string &type = "text/html") {
-
-    // }
     // void SetRedirect(const std::string &url, int status = 302) {
 
     // }
-    // // 判断是否是短连接
-    // bool Close() {
-    // }
+    // 判断是否是短连接?
+    bool Close() {
+        // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
+        if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
+            return false;
+        }
+        return true;
+    }
 };
 // 因为TCP面向字节流，因此在接收缓冲区中的HTTP请求可能不足一个完成的报文
 // 因此我们需要按照HTTP的格式解析已经收到的HTTP请求报文（可能是一部分），若只解析了一部分，比如请求头
@@ -442,15 +478,19 @@ public:
     HttpContext(): _resp_status(200), _recv_status(RECV_HTTP_LINE) {
     }
     void Reset() {
-
+        _resp_status = 200;
+        _recv_status = RECV_HTTP_LINE;
+        _request.Reset();
     }
     int RespStatus() {
-
+        return _resp_status;
     }
     HttpRecvStatus RecvStatus() {
-
+        return _recv_status;
     }
+    // Context类型，一个Connection分配一个，字段中有一个_request
     HttpRequest &Request() {
+        return _request;
     }
     // Buffer? : void OnMessage(const PtrConnection &conn, Buffer *buffer)
     //           业务处理函数，是当将内核TCP接收缓冲区读取到应用层_in_buffer中后
@@ -640,13 +680,34 @@ public:
         _server(port, thread_num, timeout) {
         // std::function<void (const PtrConnection &, Buffer *in_buffer)>
         _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
+        _server.SetConnectedCallback(std::bind(&HttpServer::OnConnected, this, std::placeholders::_1));
+    }
+    void SetBaseDir(const std::string &path) {
+        assert(Util::IsDirectory(path) == true);
+        _basedir = path;
+    }
+    /*设置/添加，请求（请求的正则表达）与处理函数的映射关系*/
+    void Get(const std::string &pattern, const Handler &handler) {
+        _get_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Post(const std::string &pattern, const Handler &handler) {
+        _post_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Put(const std::string &pattern, const Handler &handler) {
+        _put_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Delete(const std::string &pattern, const Handler &handler) {
+        _delete_route.push_back(std::make_pair(std::regex(pattern), handler));
+    }
+    void Listen() {
+        _server.Start();
     }
 private:
     // 实际上，当server的某通信TCP套接字读事件就绪时，会读对端发送的数据到Connection的_in_buffer中
     // （对于Http server来说，就是一个http request字符串），我们需要进行业务处理，下方OnMessage方法就是业务处理方法
     void OnMessage(const PtrConnection &conn, Buffer *in_buffer) {
         // 1. 获取上下文，指针指向Connection的_context字段
-        HttpContext *context = conn->GetContext()->get<HttpContext>();
+        HttpContext *context = conn->GetContext()->get<HttpContext>();    // 获取上下文（解析应用层报文）
         // 2. 通过上下文对接收缓冲区中的数据进行解析，得到HttpRequest对象
         context->RecvHttpRequest(in_buffer);
         HttpRequest &req = context->Request();   // 当前解析出的Request
@@ -654,7 +715,7 @@ private:
         //  2.1 如果缓冲区的数据解析出错，就直接回复出错响应
         if (context->RespStatus() >= 400) {
             //进行错误响应，关闭连接
-            ErrorHandler(req, &rsp);     //填充一个错误显示页面数据到rsp中
+            ErrorHandler(&rsp);     //填充一个错误显示页面数据到rsp中
             WriteResponse(conn, req, rsp);//组织响应发送给客户端
             // 注意，此上下文实际上是存储在Connection的内部的，所以我们需要进行清理。但是，后面要关闭连接，也就无所谓了其实
             context->Reset();
@@ -678,6 +739,29 @@ private:
         if (rsp.Close() == true) {
             conn->Shutdown();  // 短链接则直接关闭
         }
+    }
+    // 在连接建立时，调用此函数，设置上下文（解析应用层报文）
+    void OnConnected(const PtrConnection &conn) {
+        conn->SetContext(HttpContext());
+        DBG_LOG("NEW CONNECTION %p", conn.get());
+    }
+    void ErrorHandler(HttpResponse *rsp) {
+        //1. 组织一个错误展示页面
+        std::string body;
+        body += "<html>";
+        body += "<head>";
+        body += "<meta http-equiv='Content-Type' content='text/html;charset=utf-8'>";
+        body += "</head>";
+        body += "<body>";
+        body += "<h1>";
+        body += std::to_string(rsp->_status);
+        body += " ";
+        body += Util::StatusToDesc(rsp->_status);
+        body += "</h1>";
+        body += "</body>";
+        body += "</html>";
+        //2. 将页面数据，当作响应正文，放入rsp中
+        rsp->SetContent(body, "text/html");
     }
     void WriteResponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
         //1. 先完善头部字段
@@ -715,7 +799,7 @@ private:
 
         // 判断是否是在请求一个合理的存在的静态资源，若是，则进行读取静态资源
         if(IsFileHandler(req) == true) {
-            // 此时，是在请求一个静态资源，且静态资源存在，且合法，且有静态资源根目录....
+            // 此时，是在请求一个静态资源，且静态资源存在，且合法，且有静态资源根目录，且是一个普通文件....
             // 进行读取静态资源到HttpResponse的正文中？
             FileHandler(req, rsp);
         }
