@@ -381,10 +381,12 @@ public:
     }
     // 获取HTTP请求的正文长度~
     size_t ContentLength() const {
-        if(_headers.find("content-length") == _headers.end()) {   // 其实有接口了，也就是HasHeader = =
+        // 这他妈不是傻逼码？？？？？？
+        // if(_headers.find("content-length") == _headers.end()) {   // 其实有接口了，也就是HasHeader = =
+        if(_headers.find("Content-Length") == _headers.end()) {   // 其实有接口了，也就是HasHeader = =
             return 0;
         }
-        return std::stoul(_headers.find("content-length")->second);   // yzl~~其实有GetHander了
+        return std::stoul(_headers.find("Content-Length")->second);   // yzl~~其实有GetHander了
     }
     // 判断是否是短连接?
     bool Close() const {
@@ -539,7 +541,7 @@ private:
             _resp_status = 414; // URI TOO LONG
             return false;
         }
-        DBG_LOG("请求头line被解析之前: %s", line.c_str());
+        // DBG_LOG("请求头line被解析之前: %s", line.c_str());
         // 接收到了一行长度正常的请求行
         bool ret = ParseHttpLine(line);
         if(ret == false) {
@@ -547,7 +549,7 @@ private:
         }
         // 首行处理完毕，进入头部获取解析阶段
         _recv_status = RECV_HTTP_HEAD;
-        DBG_LOG("context解析出的Request请求头: method: %s, path:%s, version:%s", _request._method.c_str(), _request._path.c_str(), _request._version.c_str());
+        // DBG_LOG("context解析出的Request请求头: method: %s, path:%s, version:%s", _request._method.c_str(), _request._path.c_str(), _request._version.c_str());
         return true;
     }
     bool ParseHttpLine(const std::string line) {
@@ -568,7 +570,7 @@ private:
         //4 : HTTP/1.1
         // 请求方法
         _request._method = matches[1];    
-        DBG_LOG("ParseHttpLine: method: %s", _request._method.c_str());
+        // DBG_LOG("ParseHttpLine: method: %s", _request._method.c_str());
         // 请求方法可能为小写，需要进行转换
         std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
         // 资源路径，需要进行URL解码!!!
@@ -657,12 +659,14 @@ private:
         size_t length = _request.ContentLength();
         // 若HTTP请求没有正文，直接处理结束
         if(length == 0) {
+            DBG_LOG("_request.ContentLength() == 0");
             _recv_status = RECV_HTTP_OVER;
             return true;
         }
         // 有正文，第一次处理正文，也可能不是第一次，也就是_request._body中已经有了之前接收的一部分正文
         size_t real_length = length - _request._body.size();   // 可能已经接收一部分了
         if(buffer->ReadableSize() >= real_length) {
+            DBG_LOG("buffer->ReadableSize() >= real_length");
             _request._body.append(buffer->ReadAsString(real_length));
             _recv_status = RECV_HTTP_OVER;
             return true;
@@ -721,10 +725,12 @@ private:
         // 1. 获取上下文，指针指向Connection的_context字段
         HttpContext *context = conn->GetContext()->get<HttpContext>();    // 获取上下文（解析应用层报文）
         // 2. 通过上下文对接收缓冲区中的数据进行解析，得到HttpRequest对象
-        char buff[10240];
-        snprintf(buff, in_buffer->ReadableSize(), in_buffer->ReadPosition());
-        buff[in_buffer->ReadableSize()] = 0;
-        DBG_LOG("[%s]", buff);
+        {
+            char buff[10240];
+            snprintf(buff, in_buffer->ReadableSize(), in_buffer->ReadPosition());
+            buff[in_buffer->ReadableSize()] = 0;
+            DBG_LOG("in_buffer: [%s]", buff);
+        }
         context->RecvHttpRequest(in_buffer);
         HttpRequest &req = context->Request();   // 当前解析出的Request
         HttpResponse rsp(context->RespStatus()); // 进行响应的Response，目前只有_status状态码字段被设置了
@@ -739,6 +745,7 @@ private:
             conn->Shutdown();//关闭连接
             return ;
         }
+        DBG_LOG("OnMessage: %s", context->RecvStatus() == RECV_HTTP_OVER ? "recv_over" : "recv_not_over");
         if (context->RecvStatus() != RECV_HTTP_OVER) {
             // 当前还没有解析出一个完成的http请求报文，等新数据到来再重新继续处理
             return ;

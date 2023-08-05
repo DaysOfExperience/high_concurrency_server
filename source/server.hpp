@@ -947,7 +947,7 @@ public:
         _channel.SetErrorCallback(std::bind(&Connection::HandleError, this));
         _channel.SetEventCallback(std::bind(&Connection::HandleEvent, this));
     }
-    ~Connection() {}
+    ~Connection() { DBG_LOG("RELEASE CONNECTION:%p", this); }
     // int Fd() {    // useless
     // }
     // 打印Connection所属线程id，for Debug
