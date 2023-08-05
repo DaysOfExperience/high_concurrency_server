@@ -389,6 +389,14 @@ public:
     // 判断是否是短连接?
     bool Close() const {
         // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
+        DBG_LOG("=======================");
+        for(auto & i : _headers) {
+            DBG_LOG("%s : %s", i.first.c_str(), i.second.c_str());
+        }
+        DBG_LOG("=======================");
+        DBG_LOG("HasHeader(Connection): %d", HasHeader("Connection"));
+        DBG_LOG("GetHeader(Connection): %d", GetHeader("Connection") == "keep-alive");
+        DBG_LOG("GetHeader(Connection): %s", GetHeader("Connection").c_str());
         if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
             return false;
         }
@@ -531,6 +539,7 @@ private:
             _resp_status = 414; // URI TOO LONG
             return false;
         }
+        DBG_LOG("请求头line被解析之前: %s", line.c_str());
         // 接收到了一行长度正常的请求行
         bool ret = ParseHttpLine(line);
         if(ret == false) {
@@ -538,6 +547,7 @@ private:
         }
         // 首行处理完毕，进入头部获取解析阶段
         _recv_status = RECV_HTTP_HEAD;
+        DBG_LOG("context解析出的Request请求头: method: %s, path:%s, version:%s", _request._method.c_str(), _request._path.c_str(), _request._version.c_str());
         return true;
     }
     bool ParseHttpLine(const std::string line) {
@@ -557,7 +567,8 @@ private:
         //3 : user=xiaoming&pass=123123
         //4 : HTTP/1.1
         // 请求方法
-        _request._method = matches[1];
+        _request._method = matches[1];    
+        DBG_LOG("ParseHttpLine: method: %s", _request._method.c_str());
         // 请求方法可能为小写，需要进行转换
         std::transform(_request._method.begin(), _request._method.end(), _request._method.begin(), ::toupper);
         // 资源路径，需要进行URL解码!!!
@@ -633,7 +644,8 @@ private:
             return false;
         }
         auto left = line.substr(0, pos);
-        auto right = line.substr(pos + 1);
+        // auto right = line.substr(pos + 1);    // ???????????????????????????????????????????????????
+        auto right = line.substr(pos + std::string(": ").size());
         _request.SetHeader(left, right);   // 一个查询字符串提取出来了
         return true;
     }
@@ -709,6 +721,10 @@ private:
         // 1. 获取上下文，指针指向Connection的_context字段
         HttpContext *context = conn->GetContext()->get<HttpContext>();    // 获取上下文（解析应用层报文）
         // 2. 通过上下文对接收缓冲区中的数据进行解析，得到HttpRequest对象
+        char buff[10240];
+        snprintf(buff, in_buffer->ReadableSize(), in_buffer->ReadPosition());
+        buff[in_buffer->ReadableSize()] = 0;
+        DBG_LOG("[%s]", buff);
         context->RecvHttpRequest(in_buffer);
         HttpRequest &req = context->Request();   // 当前解析出的Request
         HttpResponse rsp(context->RespStatus()); // 进行响应的Response，目前只有_status状态码字段被设置了
@@ -737,6 +753,7 @@ private:
         context->Reset();
         // 6. 根据长短连接判断是否关闭连接/继续处理
         if (rsp.Close() == true) {
+            DBG_LOG("!!!!!!!!!!!!!!!!!");
             conn->Shutdown();  // 短链接则直接关闭
         }
     }
@@ -766,8 +783,10 @@ private:
     void WriteResponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
         //1. 先完善头部字段
         if (req.Close() == true) {
+            DBG_LOG("nononononono");
             rsp.SetHeader("Connection", "close");
         }else {
+            DBG_LOG("yyyyyyyyyyyyyyyyyyyyyyy");
             rsp.SetHeader("Connection", "keep-alive");
         }
         if (rsp._body.empty() == false && rsp.HasHeader("Content-Length") == false) {

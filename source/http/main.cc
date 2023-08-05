@@ -12,7 +12,7 @@ std::string RequestStr(const HttpRequest &req) {
         ss << it.first << ": " << it.second << "\r\n";
     }
     ss << "\r\n";
-    ss << req._body;
+    ss << req._body;   // 这是对端发来的Request里的正文
     return ss.str();
 }
 void Hello(const HttpRequest &req, HttpResponse *rsp) 

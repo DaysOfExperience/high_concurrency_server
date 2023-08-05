@@ -358,17 +358,19 @@ public:
     void RemoveFromEpoll();
     void UpdateFromEpoll();
     // 事件处理: 调用此时所有就绪事件的回调函数，即处理当前文件描述符的就绪事件~
-    void HandleEvent() {
-        if(_event_callback) _event_callback();
-        if((_revents & EPOLLIN) || (_revents & EPOLLPRI) || (_revents & EPOLLHUP)) {
-            if(_read_callback) _read_callback();
-        }else if(_revents & EPOLLOUT) {
-            if(_write_callback) _write_callback();
-        } else if(_revents & EPOLLERR) {
-            if(_error_callback) _error_callback();
-        } else if(_revents & EPOLLHUP) {
-            if(_close_callback) _close_callback();
+    void HandleEvent() {            
+        if ((_revents & EPOLLIN) || (_revents & EPOLLRDHUP) || (_revents & EPOLLPRI)) {
+            if (_read_callback) _read_callback();
         }
+        /*有可能会释放连接的操作事件，一次只处理一个*/
+        if (_revents & EPOLLOUT) {
+            if (_write_callback) _write_callback();
+        }else if (_revents & EPOLLERR) {
+            if (_error_callback) _error_callback();//一旦出错，就会释放连接，因此要放到前边调用任意回调
+        }else if (_revents & EPOLLHUP) {
+            if (_close_callback) _close_callback();
+        }
+        if (_event_callback) _event_callback();
     }
 };
 #define MAX_EPOLLEVENTS 1024
@@ -634,13 +636,14 @@ public:
     _event_fd(CreateEventFd()), 
     _event_channel(new Channel(this, _event_fd)),
     _timer_wheel(this) {
-        DBG_LOG("test 222");
+        // DBG_LOG("test 222");
         // 有关timerwheel：在构造TimerWheel的对象时，传过去EventLoop指针，就已经完成了所有操作了，包括timerfd的回调设定
         // 包括timerfd在EventLoop中的读事件关心。外部可以调用TimerWheel的三个接口进行任务添加，刷新，删除~(RunInLoop)
         _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventfd, this));
         _event_channel->EnableRead();
         // 将eventfd的读事件监督交给epoll(poller)，这样可以通过WriteEventfd来唤醒阻塞在epoll_wait中的epoll线程。
     }
+    size_t Thread() { return std::hash<std::thread::id>{}(_thread_id); }
     // 真-Event Loop
     void Start() {
         // 事件监控 -> 事件处理 -> 执行任务(????)
@@ -659,12 +662,21 @@ public:
     }
     // 判断执行RunInLoop的线程是否是该EventLoop绑定线程，若是，则直接执行任务即可
     // 若不是，则压入任务池中
+    // 一般来说，都是EventLoop所绑定的线程以外的线程来执行这个~
     void RunInLoop(const Task &cb) {
         if (IsInLoop()) {
             return cb();
         }
         return QueueInLoop(cb);
     }
+    void AssertInLoop() {
+        assert(_thread_id == std::this_thread::get_id());
+    }
+    // 用于判断当前线程是否是EventLoop对应的线程；
+    bool IsInLoop() {
+        return (_thread_id == std::this_thread::get_id());
+    }
+private:
     // 线程安全的任务池相关的   ????
     void RunAllTask() {
         // 执行任务池中的所有任务
@@ -679,13 +691,6 @@ public:
         }
         return ;
     }
-    void AssertInLoop() {
-        assert(_thread_id == std::this_thread::get_id());
-    }
-    // 用于判断当前线程是否是EventLoop对应的线程；
-    bool IsInLoop() {
-        return (_thread_id == std::this_thread::get_id());
-    }
     // 将操作压入任务池
     void QueueInLoop(const Task &cb) {
         {
@@ -696,6 +701,7 @@ public:
         // 其实就是给eventfd写入一个数据，eventfd就会触发可读事件
         WriteEventFd();
     }
+public:
     // epoll相关(poller)
     // 添加描述符监控/修改描述符的事件监控
     void UpdateFromEpoll(Channel *ch) {
@@ -704,6 +710,7 @@ public:
     void RemoveFromEpoll(Channel *ch) {
         poller.RemoveFromEpoll(ch);
     }
+private:
     // eventfd相关，防止epoll在epollwait时一直阻塞。用于唤醒poller（通过向eventfd中写数据WriteEventfd）
     // static int CreateEventFd() {
     int CreateEventFd() {
@@ -740,6 +747,7 @@ public:
         }
         return ;
     }
+public:
     // TimerWheel相关: 实现非活跃连接销毁功能
     void TimerAdd(uint64_t id, uint32_t delay, const TaskFunc &cb) {
         return _timer_wheel.TimerAdd(id, delay, cb);
@@ -756,6 +764,9 @@ public:
     }
     void TimerCancel(uint64_t id) { 
         return _timer_wheel.TimerCancel(id); 
+    }
+    void TimerCancelInLoop(uint64_t id) {
+        return _timer_wheel.TimerCancelInLoop(id);
     }
     bool HasTimer(uint64_t id) {
         return _timer_wheel.HasTimer(id);
@@ -822,7 +833,7 @@ public:
       if not, you could not set base_loop */
     LoopThreadPool(int thread_num, EventLoop *base_loop = nullptr) :
         _thread_num(thread_num), _loop_index(0), _base_loop(base_loop) {
-        DBG_LOG("test 444");
+        // DBG_LOG("test 444");
         for(int i = 0; i < _thread_num; ++i) {
             _threads.push_back(new LoopThread());
             _loops.push_back(_threads[i]->GetLoop());  // safely
@@ -939,11 +950,14 @@ public:
     ~Connection() {}
     // int Fd() {    // useless
     // }
+    // 打印Connection所属线程id，for Debug
+    size_t Thread() {
+        return _loop->Thread();
+    }
     uint64_t Id() {
         return _conn_id;
     }
     // bool Connected() { return (_statu == CONNECTED); }    // useless
-    // 完了再说~
     void SetContext(const Any &context) { 
         _context = context; 
     }
@@ -1047,6 +1061,7 @@ private:
         return HandleClose();
     }
     void HandleEvent() {
+        assert(_loop->IsInLoop());   // test
         if(_enable_inactive_release == true) {
             // 需要刷新定时销毁任务
             _loop->TimerRefreshInLoop(_timer_id);  // _conn_id
@@ -1063,7 +1078,7 @@ private:
         _channel.EnableRead();  // 使连接绑定的EventLoop里面的epoll关心读事件
         _status = CONNECTED;
         if(_connected_callback) {
-            _connected_callback(shared_from_this());
+            _connected_callback(shared_from_this());   // 设置上下文(应用层协议~)
         }
     }
     // 这个关闭操作并非实际的连接释放操作，需要判断还有没有数据待处理，待发送
@@ -1093,9 +1108,7 @@ private:
         if(_loop->HasTimer(_timer_id)) {
             // 此时还有定时销毁任务
             _enable_inactive_release = false;
-            if(_loop->HasTimer(_timer_id)) {
-                _loop->TimerCancel(_timer_id);
-            }
+            _loop->TimerCancelInLoop(_timer_id);
         }
         // User设定的连接关闭的回调函数
         if(_close_callback) {
@@ -1121,9 +1134,9 @@ private:
         // 按理来说这里不可能是已存在的
         if(_loop->HasTimer(_conn_id)) {
             // 定时任务已存在，刷新即可
-            return _loop->TimerRefresh(_conn_id);
+            return _loop->TimerRefreshInLoop(_conn_id);
         }
-        _loop->TimerAdd(_conn_id, sec, std::bind(&Connection::Release, this));
+        _loop->TimerAddInLoop(_conn_id, sec, std::bind(&Connection::ReleaseInLoop, this));    // update
     }
     // 取消非活跃销毁???? 这有用?
     // void CancelInactiveReleaseInLoop() {}
@@ -1142,7 +1155,6 @@ public:
     Acceptor(EventLoop *base_loop, int port) :
         _listen_socket(CreateListenSocket(port)),
         _channel(base_loop, _listen_socket.Fd()) {
-        DBG_LOG("test 333");
         _channel.SetReadCallback(std::bind(&Acceptor::HandleRead, this));
         // 这里只是设定了listen套接字的读事件回调函数，也就是HandleRead
         // 但是还没有启动读事件关心在_base_loop上
@@ -1165,6 +1177,7 @@ private:
     }
     int CreateListenSocket(int port) {
         bool ret = _listen_socket.CreateListenSocket(port);
+        _listen_socket.ReuseAddress();   // 地址重用
         assert(ret == true);
         return _listen_socket.Fd();
     }
@@ -1183,6 +1196,7 @@ private:
     LoopThreadPool _pool;    // 从属Reactor线程池
     std::unordered_map<uint64_t, PtrConnection> _conns;
 
+private:
     // HandleRead读事件监控回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
     // 进行业务处理，业务处理函数即_message_callback，为用户设定的。
     using MessageCallback = std::function<void (const PtrConnection &, Buffer *in_buffer)>;
@@ -1206,7 +1220,6 @@ public:
     _base_loop(),
     _acceptor(&_base_loop, _port),
     _pool(thread_num, &_base_loop) {
-        DBG_LOG("test 111");
         // 先进行第一步，获取新连接之后才能分配到从属Reactor线程池中，再启动_base_loop对于listen套接字的读关心
         // 否则在获取新客户端连接之后，无法将新连接分配到从属Reactor线程池中，因为Acceptor的_accept_callback为空~
         _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
@@ -1246,7 +1259,7 @@ public:
     void RemoveConnectionInLoop(const PtrConnection &conn) {
         // 将Connection从_conns中移除掉
         uint64_t id = conn->Id();
-        if(_conns.find(id) == _conns.end()) {
+        if(_conns.find(id) != _conns.end()) {
             _conns.erase(id);
         }
     }
@@ -1256,6 +1269,13 @@ public:
         // 从属Reactor线程在构造时就已经开始eventloop了(但是关心的文件描述符数量为空)
         // 因为主Reactor线程还没开始，所以从属Reactor线程池是安全的~
     }
+    void ShowAllConnection() {
+        DBG_LOG("##########################");
+        for(auto &i: _conns) {
+            DBG_LOG("Connection: %ld, %uld", i.first, i.second->Thread());
+        }
+        DBG_LOG("##########################");
+    }
 private:
     // 主Reactor线程获取新连接之后会执行这个~
     void NewConnection(int fd) {
@@ -1263,7 +1283,7 @@ private:
         PtrConnection conn(new Connection(loop, _conn_id, fd));
         // User设定的业务处理函数，一定需要的
         conn->SetMessageCallback(_message_callback);
-        // 可有可无，但是如果User设定了，则需要设定
+        // 如果User设定了，则需要设定
         if(_connected_callback) {
             conn->SetConnectedCallback(_connected_callback);
         }

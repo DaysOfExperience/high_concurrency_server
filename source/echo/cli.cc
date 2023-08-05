@@ -14,6 +14,7 @@ int main()
             buff[sz] = 0;
         }
         DBG_LOG("server echo# %s", buff);
+        sleep(3);
     }
     return 0;
 }
