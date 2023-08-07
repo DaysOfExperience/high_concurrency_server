@@ -1,4 +1,5 @@
 /*长连接测试1：创建一个客户端持续给服务器发送数据，直到超过超时时间看看是否正常*/
+/*超时连接测试1：创建一个客户端，给服务器发送一次数据后，不动了，查看服务器是否会正常的超时关闭连接*/
 #include "../source/server.hpp"
 
 int main()
@@ -11,7 +12,7 @@ int main()
         char buf[1024] = {0};
         assert(cli_sock.Recv(buf, 1023));
         DBG_LOG("[%s]", buf);
-        sleep(3);
+        sleep(1);
     }
     cli_sock.Close();
     return 0;

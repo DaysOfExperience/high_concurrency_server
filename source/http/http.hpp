@@ -1,4 +1,5 @@
 #include "../server.hpp"
+// #include "../../../__zz11/server.hpp"
 #include <regex>
 #include <fstream>
 #include <sys/stat.h>
@@ -391,14 +392,14 @@ public:
     // 判断是否是短连接?
     bool Close() const {
         // 没有Connection字段，或者有Connection但是值是close，则都是短链接，否则就是长连接
-        DBG_LOG("=======================");
-        for(auto & i : _headers) {
-            DBG_LOG("%s : %s", i.first.c_str(), i.second.c_str());
-        }
-        DBG_LOG("=======================");
-        DBG_LOG("HasHeader(Connection): %d", HasHeader("Connection"));
-        DBG_LOG("GetHeader(Connection): %d", GetHeader("Connection") == "keep-alive");
-        DBG_LOG("GetHeader(Connection): %s", GetHeader("Connection").c_str());
+        //DBG_LOG("=======================");
+        // for(auto & i : _headers) {
+        //     DBG_LOG("%s : %s", i.first.c_str(), i.second.c_str());
+        // }
+        // DBG_LOG("=======================");
+        // DBG_LOG("HasHeader(Connection): %d", HasHeader("Connection"));
+        // DBG_LOG("GetHeader(Connection): %d", GetHeader("Connection") == "keep-alive");
+        // DBG_LOG("GetHeader(Connection): %s", GetHeader("Connection").c_str());
         if (HasHeader("Connection") == true && GetHeader("Connection") == "keep-alive") {
             return false;
         }
@@ -659,7 +660,7 @@ private:
         size_t length = _request.ContentLength();
         // 若HTTP请求没有正文，直接处理结束
         if(length == 0) {
-            DBG_LOG("_request.ContentLength() == 0");
+            // DBG_LOG("_request.ContentLength() == 0");
             _recv_status = RECV_HTTP_OVER;
             return true;
         }
@@ -692,8 +693,12 @@ private:
     TcpServer _server;
     std::string _basedir;    // 静态资源根目录
 public:
-    HttpServer(int port, int thread_num = 2, int timeout = DEFALT_TIMEOUT) :
+    HttpServer(int port, int thread_num = 0, int timeout = DEFALT_TIMEOUT) :
         _server(port, thread_num, timeout) {
+            // HttpServer(int port) :
+        // _server(port) {
+        // _server.SetThreadCount(3);
+        // _server.EnableInactiveRelease(20);
         // std::function<void (const PtrConnection &, Buffer *in_buffer)>
         _server.SetMessageCallback(std::bind(&HttpServer::OnMessage, this, std::placeholders::_1, std::placeholders::_2));
         _server.SetConnectedCallback(std::bind(&HttpServer::OnConnected, this, std::placeholders::_1));
@@ -729,23 +734,30 @@ private:
             char buff[10240];
             snprintf(buff, in_buffer->ReadableSize(), in_buffer->ReadPosition());
             buff[in_buffer->ReadableSize()] = 0;
-            DBG_LOG("in_buffer: [%s]", buff);
+            // DBG_LOG("in_buffer: [%s]", buff);
         }
         context->RecvHttpRequest(in_buffer);
         HttpRequest &req = context->Request();   // 当前解析出的Request
         HttpResponse rsp(context->RespStatus()); // 进行响应的Response，目前只有_status状态码字段被设置了
         //  2.1 如果缓冲区的数据解析出错，就直接回复出错响应
         if (context->RespStatus() >= 400) {
+            DBG_LOG("context->RespStatus() >= 400");
             //进行错误响应，关闭连接
             ErrorHandler(&rsp);     //填充一个错误显示页面数据到rsp中
             WriteResponse(conn, req, rsp);//组织响应发送给客户端
             // 注意，此上下文实际上是存储在Connection的内部的，所以我们需要进行清理。但是，后面要关闭连接，也就无所谓了其实
+            // hahah  这个非常有必要
+            // 当出错了，context的响应状态码为400，解析状态为ERROR
+            // 下面shutdown内部会检测接收缓冲区，若>0，则继续回调，此时又进行解析，解析状态为ERROR，直接就会结束解析过程，进行错误响应
+            // 就会一直循环
+            // 解决方法：将接收缓冲区的数据清空，shutdown就不会再回调这里了，再重置一下context的接收状态，不能是RECV_ERROR。
+            // 否则下次解析的时候其实解析请求行的时候就会因为解析状态而直接退出
             context->Reset();
             in_buffer->MoveReadOffset(in_buffer->ReadableSize());//出错了就把缓冲区数据清空
             conn->Shutdown();//关闭连接
             return ;
         }
-        DBG_LOG("OnMessage: %s", context->RecvStatus() == RECV_HTTP_OVER ? "recv_over" : "recv_not_over");
+        // DBG_LOG("OnMessage: %s", context->RecvStatus() == RECV_HTTP_OVER ? "recv_over" : "recv_not_over");
         if (context->RecvStatus() != RECV_HTTP_OVER) {
             // 当前还没有解析出一个完成的http请求报文，等新数据到来再重新继续处理
             return ;
@@ -760,14 +772,13 @@ private:
         context->Reset();
         // 6. 根据长短连接判断是否关闭连接/继续处理
         if (rsp.Close() == true) {
-            DBG_LOG("!!!!!!!!!!!!!!!!!");
             conn->Shutdown();  // 短链接则直接关闭
         }
     }
     // 在连接建立时，调用此函数，设置上下文（解析应用层报文）
     void OnConnected(const PtrConnection &conn) {
         conn->SetContext(HttpContext());
-        DBG_LOG("NEW CONNECTION %p", conn.get());
+        // DBG_LOG("NEW CONNECTION %p", conn.get());
     }
     void ErrorHandler(HttpResponse *rsp) {
         //1. 组织一个错误展示页面
@@ -790,10 +801,10 @@ private:
     void WriteResponse(const PtrConnection &conn, const HttpRequest &req, HttpResponse &rsp) {
         //1. 先完善头部字段
         if (req.Close() == true) {
-            DBG_LOG("nononononono");
+            // DBG_LOG("req.Close() == true");
             rsp.SetHeader("Connection", "close");
         }else {
-            DBG_LOG("yyyyyyyyyyyyyyyyyyyyyyy");
+            // DBG_LOG("req.Close() != true");
             rsp.SetHeader("Connection", "keep-alive");
         }
         if (rsp._body.empty() == false && rsp.HasHeader("Content-Length") == false) {
