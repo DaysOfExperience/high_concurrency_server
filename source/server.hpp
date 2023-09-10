@@ -42,7 +42,9 @@
 #define DBG_LOG(format, ...) LOG(DBG, format, ##__VA_ARGS__)
 #define ERR_LOG(format, ...) LOG(ERR, format, ##__VA_ARGS__)
 
+// Buffer模块是⼀个缓冲区模块，⽤于实现通信中⽤⼾态的接收缓冲区和发送缓冲区功能
 // 缓冲区类，实例化之后为通信套接字的接收缓冲区/发送缓冲区, 作为每一个服务器中的TCP连接的应用层缓冲区(发送&接收)
+// Buffer内部不涉及动态内存管理，若直接创建Buffer对象，则创建在栈区
 #define BUFFER_DEFAULT_SIZE 1024    // 1024char 1024字节~
 class Buffer
 {
@@ -138,14 +140,16 @@ public:
         _write_idx = 0;
     }
 };
+// Socket模块是对套接字操作封装的⼀个模块，主要实现的socket的各项操作。
 // 对套接字的封装，封装网络编程中的套接字相关的常用操作
+// 一个sockfd数据成员，很多方法...
 #define MAX_LISTEN 1024
 class Socket
 {
 private:
     int _sockfd;
 public:
-    Socket() {}
+    Socket(): _sockfd(0) {}
     Socket(int sockfd) : _sockfd(sockfd) {}
     ~Socket() {
         Close();
@@ -176,6 +180,8 @@ public:
         }
         return true;
     }
+    // listen套接字第二个参数：全连接队列 = backlog+1？
+    // 也就是全连接队列 = 1025，可以同时建立起1025个客户端连接，并且不accept，放在全连接队列中.
     bool Listen(int backlog = MAX_LISTEN) {
         // int listen(int backlog)
         int ret = listen(_sockfd, backlog);
@@ -217,23 +223,24 @@ public:
             // EAGAIN 当前socket的接收缓冲区中没有数据了，在非阻塞的情况下才会有这个错误
             // EINTR  表示当前socket的阻塞等待，被信号打断了，
             if (errno == EAGAIN || errno == EINTR) {
-                return 0;//表示这次接收没有接收到数据
+                return 0;//表示缓冲区中没有数据可读
             }
-            // ERR_LOG("SOCKET RECV FAILED!!");
+            ERR_LOG("SOCKET RECV FAILED!!");
             return -1;
         }
         return ret; //实际接收的数据长度
     }
     ssize_t RecvNonBlock(void *buf, size_t len) {
-        return Recv(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前接收为非阻塞。
+        return Recv(buf, len, MSG_DONTWAIT); // MSG_DONTWAIT 表示当前读取操作为非阻塞读取。
     }
     // 发送数据
     ssize_t Send(const void *buf, size_t len, int flag = 0) {
         // ssize_t send(int sockfd, void *data, size_t len, int flag);
+        if(len == 0) return 0;
         ssize_t ret = send(_sockfd, buf, len, flag);
         if (ret < 0) {
             if (errno == EAGAIN || errno == EINTR) {
-                return 0;
+                return 0;   // 发送缓冲区满了
             }
             ERR_LOG("SOCKET SEND FAILED!!");
             return -1;
@@ -268,7 +275,7 @@ public:
         val = 1;
         setsockopt(_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*)&val, sizeof(int));
     }
-    // 设置套接字文件为非阻塞（若没有数据/发送缓冲区已满，则出错返回）
+    // 设置套接字描述符为非阻塞（若接收缓冲区没有数据可读/发送缓冲区已满，则出错返回）
     void NonBlock() {
         int flag = fcntl(_sockfd, F_GETFL, 0);
         fcntl(_sockfd, F_SETFL, flag | O_NONBLOCK);
@@ -283,7 +290,11 @@ public:
 
 class EventLoop;
 // 事件管理类: 该文件描述符关心哪些事件、哪些事件就绪、每个事件就绪时对应的回调函数
-/*1. 提供EventLoop*(该文件描述符的监管放在哪个Epoll中了)和fd 2. 回调函数设定 3. 该文件描述符想要关心哪些事件(Enable)*/
+/*
+1. 提供EventLoop*(该文件描述符的监管放在哪个Epoll中了)和fd 
+2. 回调函数设定 
+3. 该文件描述符想要关心哪些事件(Enable)
+*/
 class Channel
 {
 private:
@@ -314,9 +325,9 @@ public:
     void SetEventCallback(const EventCallback &cb) { _event_callback = cb; }
     // 关心可读/取消关心可读事件(一般来说，每个文件描述符（listen套接字，普通TCP连接，eventfd）开始时都只关心读事件)
     // 下面几个方法都需要这个channel关联的epoll(EventLoop)来进行实际设定，且具有立即性，调用之后立刻生效
-    bool Readable()  { return _events & EPOLLIN; }
-    bool Writeable() { return _events & EPOLLOUT; }
-    void EnableRead() { _events |= EPOLLIN; UpdateFromEpoll(); }
+    bool Readable()  { return _events & EPOLLIN; }   // 是否关心可读
+    bool Writeable() { return _events & EPOLLOUT; }  // 是否关心可写
+    void EnableRead() { _events |= EPOLLIN; UpdateFromEpoll(); }  // 启动可读事件关心
     void DisableRead() { _events &= ~EPOLLIN; UpdateFromEpoll(); }
     void EnableWrite() { _events |= EPOLLOUT; UpdateFromEpoll(); }
     void DisableWrite() { _events &= ~EPOLLOUT; UpdateFromEpoll(); }
@@ -343,8 +354,14 @@ public:
     }
 };
 #define MAX_EPOLLEVENTS 1024
-/*该类直接被EventLoop封装。构造函数调用时，直接构造出一个epoll模型
-提供三个接口1. void UpdateFromEpoll(Channel *ch) 2. void RemoveFromEpoll(Channel *ch) 3. Poll(一次epoll_wait)*/
+/*
+对Epoll模型的封装，每一个Poller都监管了若干个连接，且可以调用Poll进行epoll_wait
+该类直接被EventLoop封装。构造函数调用时，直接构造出一个epoll模型
+提供三个接口
+1. void UpdateFromEpoll(Channel *ch) 
+2. void RemoveFromEpoll(Channel *ch) 
+3. Poll(一次epoll_wait)
+*/
 class Poller
 {
 private:
@@ -378,7 +395,7 @@ public:
         _channels.erase(ch->Fd());
         EpollCtl(ch, EPOLL_CTL_DEL);
     }
-    // 单次的epoll_wait，获取当前有事件就绪的文件描述符(返回活跃连接)
+    // 单次的epoll_wait，获取所有当前有事件就绪的文件描述符(返回活跃连接)
     void Poll(std::vector<Channel *> *actives) {
         int nfds = epoll_wait(_epfd, _revs, MAX_EPOLLEVENTS, -1); // -1阻塞、0非阻塞，>0定时阻塞
         if(nfds < 0) {
@@ -413,7 +430,7 @@ private:
             ERR_LOG("epoll ctl error: epfd:%d, op:%d, fd:%d", _epfd, op, fd);
             abort();
         }
-    }        
+    }
     // 判断一个Channel（文件描述符）是否已经加入epoll模型
     bool HasChannel(Channel *channel) {
         auto ret = _channels.find(channel->Fd());
@@ -427,11 +444,11 @@ private:
 class TimerTask
 {
 private:
-    using TaskFunc = std::function<void()>;
-    using ReleaseTimer = std::function<void()>;
-    uint64_t _id;       // 定时任务对象de唯一id
+    uint64_t _id;       // 定时任务对象の唯一id
     uint32_t _timeout;  // 定时时长
+    using TaskFunc = std::function<void()>;
     TaskFunc _task_cb;  // 定时器对象要执行的定时任务
+    using ReleaseTimer = std::function<void()>;
     ReleaseTimer _release; // 用于删除时间轮中保存的TimerTask
     bool _canceled;
 public:
@@ -442,7 +459,7 @@ public:
         _release();    // 自动执行TimerWheel中的RemoveTimer，从_timers中删除对应的定时任务(weak_ptr)
     }
     void Cancel() { _canceled = true; }
-    void SetReleaseTimer(const ReleaseTimer &cb) { _release = cb; }
+    void SetReleaseTimerFunc(const ReleaseTimer &cb) { _release = cb; }
     uint64_t GetDelayTime() { return _timeout; }
 };
 using TaskFunc = std::function<void()>;
@@ -450,27 +467,28 @@ using TaskFunc = std::function<void()>;
 class TimerWheel
 {
 private:
-    using SharedTask = std::shared_ptr<TimerTask>;
-    using WeakTask = std::weak_ptr<TimerTask>;
     int _size;  // 时间轮大小，与最大定时时间相关
     int _tick;  // 时间轮的秒针，每向前一步，就会执行时间轮的一个轮子里面的所有任务(具体多久走一步，取决于timerfd)
-    std::vector<std::vector<SharedTask>> _timerwheel;
-    std::unordered_map<uint64_t, WeakTask> _timers;
+    std::vector<std::vector<std::shared_ptr<TimerTask>>> _timerwheel;  // 时间轮！！！
+    std::unordered_map<uint64_t, std::weak_ptr<TimerTask>> _timer_tasks;  // 管理所有定时任务，通过weak_ptr的方式
 
     EventLoop *_loop;
-    int _timerfd; // 定时器描述符--可读事件回调就是读取计数器，tick指针前移，执行定时任务
+    int _timerfd; // timerfd的描述符--可读事件回调就是读取文件中的超时次数，tick指针前移，释放智能指针，执行定时任务
     std::unique_ptr<Channel> _timerfd_channel;
 public:
     TimerWheel(EventLoop *loop): _size(TIMER_WHEEL_SIZE), _timerwheel(TIMER_WHEEL_SIZE), _tick(0),
         _loop(loop), _timerfd(CreateTimerfd()), _timerfd_channel(new Channel(loop, _timerfd)) {
-        // 此处timerfd已经开始计时(我们定的是每1s超时一次)，到时间会向timerfd中写入,timerfd的读事件由EventLoop 也就是epoll监管
-        // 每到时，就调用Ontime，读取timerfd文件中的超时次数,进一步调用TickOnce，_tick前移一步（超时多次前移多步）执行超时任务
+        // 此处timerfd已经开始计时(我们定的是每1s超时一次)，到时间会向timerfd对应文件中写入
+        // timerfd的读事件由EventLoop 也就是epoll监管
+        // 每超时，文件被写入超时次数，读事件触发，就调用Ontime
+        // 读取timerfd文件中的超时次数,进一步调用TickOnce，_tick前移一步（超时多次前移多步）
+        // 释放std::shared_ptr<TimerTask>，可能执行超时任务
         _timerfd_channel->SetReadCallback(std::bind(&TimerWheel::Ontime, this));
         _timerfd_channel->EnableRead();
     }
     ~TimerWheel() {}
-    // 其实外部使用的就是下面这三个方法:1、添加任务2、刷新任务3、取消任务
-    /*定时器中有个_timers成员，定时器数据的操作有可能在多线程中进行，因此需要考虑线程安全问题
+    // 其实外部使用的就是下面这三个方法:1、添加定时任务2、刷新定时任务3、取消定时任务
+    /*定时器中有个_timer_tasks成员，定时器数据的操作有可能在多线程中进行，因此需要考虑线程安全问题
     如果不想加锁，那就把对定时器的所有操作，都放到一个线程中进行*/
     // 下面的三个方法，不能直接执行，因为存在线程安全问题,确保这些方法在EventLoop对应的线程中执行就没有线程安全问题了。
     // 所以调用RunInLoop,确保执行下方函数时，要在EventLoop线程中,如果在，则直接执行，如果不在则push到EventLoop的任务队列中
@@ -480,61 +498,66 @@ public:
     void TimerCancel(uint64_t id);
     /*这个接口存在线程安全问题--这个接口实际上不能被外界使用者调用，只能在模块内，在对应的EventLoop线程内执行*/
     bool HasTimer(uint64_t id) {
-        auto it = _timers.find(id);
-        if (it == _timers.end()) {
+        auto it = _timer_tasks.find(id);
+        if (it == _timer_tasks.end()) {
             return false;
         }
         return true;
     }
+    // 添加一个定时任务到时间轮TimerWheel中
     // 一个新的TCP连接，一个Timer定时任务，时间到了，代表超时，关闭非活跃连接
     void TimerAddInLoop(uint64_t id, uint32_t delay, const TaskFunc &cb) {
-        SharedTask task(new TimerTask(id, delay, cb));
-        task->SetReleaseTimer(std::bind(&TimerWheel::RemoveTimer, this, id));
+        std::shared_ptr<TimerTask> task(new TimerTask(id, delay, cb));
+        task->SetReleaseTimerFunc(std::bind(&TimerWheel::RemoveTimerTask, this, id));
         int pos = (_tick + delay) % _size;   // 这个任务放入的时间轮的位置
         _timerwheel[pos].push_back(task);
-        _timers.insert({id, WeakTask(task)});   // 利用shared_ptr构造weak_ptr?
+        _timer_tasks.insert({id, std::weak_ptr<TimerTask>(task)});   // 利用shared_ptr构造weak_ptr?
     }
-    // 当一个TCP连接事件就绪，代表活跃，刷新定时任务，重新计时
+    // 刷新一个定时任务
+    // 当一个TCP连接的事件就绪，代表活跃，刷新定时任务，重新计时
     void TimerRefreshInLoop(uint64_t id) {
         // 通过id在unordered_map中找到对应的保存的定时器对象的weak_ptr构造一个shared_ptr出来，添加到轮子中。
-        auto it = _timers.find(id);
-        if(it == _timers.end()) {
+        auto it = _timer_tasks.find(id);
+        if(it == _timer_tasks.end()) {
             return ;   // 任务不存在
         }
-        SharedTask pTask = it->second.lock(); // lock获取weak_ptr管理的对象对应的shared_ptr
+        std::shared_ptr<TimerTask> pTask = it->second.lock(); // lock获取weak_ptr管理的对象对应的shared_ptr
         uint64_t delay = pTask->GetDelayTime();
         int pos = (_tick + delay) % _size;
-        _timerwheel[pos].push_back(pTask);
+        _timerwheel[pos].push_back(pTask);   // 就是往时间轮中再添加一个智能指针喽
     }
-    // 当一个连接关闭时，要取消对应的定时任务~(只是到时间之后不会执行对应任务，实则对应任务还是在_timers内的，这里不会删除)
+    // 取消一个定时任务
+    // 当一个连接关闭时，要取消对应的定时任务~(只是到时间之后不会执行对应任务，实则对应TimerTask还是在_timer_tasks内的，这里不会删除)
     void TimerCancelInLoop(uint64_t id) {
-        auto it = _timers.find(id);
-        if(it == _timers.end()) {
+        auto it = _timer_tasks.find(id);
+        if(it == _timer_tasks.end()) {
             return ;   // 任务不存在
         }
-        SharedTask pTask = it->second.lock();
+        std::shared_ptr<TimerTask> pTask = it->second.lock();
         if(pTask) pTask->Cancel();
     }
     void TickOnce() {
         _tick += 1;
         _tick %= _size;
         // 销毁这个轮子上的所有智能指针，若引用计数变为0，则执行TimerTask的析构函数，执行定时任务（若没有cancel）
-        _timerwheel[_tick].clear();
+        _timerwheel[_tick].clear();  // _timerwheel[_tick]是一个vector<shared_ptr<TimerTask>>
     }
     // 我们实现一个时间轮,timerfd用epoll监管，到时间，timerfd读就绪，根据读事件回调函数就执行Ontime，从而执行时间轮中任务而已。
     // 可以说，下面这个操作，每到一次时间都会执行，只是时间轮里面可能没有任务而已。
     void Ontime() {
         // 根据实际超时的次数，执行对应的超时任务
-        int times = ReadTimefd();
+        int times = ReadTimerfd();
         for (int i = 0; i < times; i++) {
             TickOnce();
         }
     }
-    // 用于当某TimerTask析构执行任务时，需要从_timers里面移除
-    void RemoveTimer(uint64_t id) {
-        auto it = _timers.find(id);
-        if (it != _timers.end()) {
-            _timers.erase(it);
+    // 用于当某TimerTask析构执行任务时，需要从_timer_tasks里面移除
+    // 主要是TimerWheel也不知道这里任务是否会执行，也就是引用计数是否为1，所以如果确实要执行任务了
+    // 再进行从 std::unordered_map<uint64_t, std::weak_ptr<TimerTask>> _timer_tasks 中删除的操作
+    void RemoveTimerTask(uint64_t id) {
+        auto it = _timer_tasks.find(id);
+        if (it != _timer_tasks.end()) {
+            _timer_tasks.erase(it);
         }
     }
     int CreateTimerfd() {
@@ -552,7 +575,7 @@ public:
         timerfd_settime(timerfd, 0, &itime, NULL);   // 自此，timerfd开始计时工作，每秒钟往timerfd对应文件中写入一个1(累积)
         return timerfd;
     }
-    int ReadTimefd() {
+    int ReadTimerfd() {
         // 有可能因为其他描述符的事件处理花费时间比较长，然后在处理定时器描述符事件的时候，就已经超时了多次
         // read读取到的数据times就是从上一次read之后超时的次数
         uint64_t times;
@@ -564,6 +587,7 @@ public:
         return times;
     }
 };
+// 将Epoll模型的Poller与线程进行整合
 class EventLoop
 {
 private:
@@ -571,17 +595,20 @@ private:
     // eventfd用于唤醒poller监控IO事件有可能导致的阻塞，当eventfd读事件就绪时，不需要关心里面的数据(8字节整数)
     int _event_fd;
     std::unique_ptr<Channel> _event_channel;
+
     Poller poller;
-    // 我他妈之前一直不明白_tasks为什么涉及线程安全,比如: EventLoop线程在Start内RunAllTask访问_tasks
-    // 而主线程在用RunInLoop往_tasks内push_back任务。就涉及线程安全~
+    // 我他妈之前一直不明白_tasks为什么涉及线程安全
+    // 比如: EventLoop线程在Start内RunAllTask访问_tasks
+    // 而主线程在用RunInLoop往_tasks内push_back任务。就涉及线程安全~hhhhhhhhhhhhhh
     using Task = std::function<void()>;
     std::vector<Task> _tasks; // 任务池
-    std::mutex _mutex;        // 实现任务池操作的线程安全
-    TimerWheel _timer_wheel;  // 定时器模块
+    std::mutex _mutex;        // 实现任务池操作的线程安全，因为这个_tasks可能并EventLoop线程和其他线程并发访问~
+
+    TimerWheel _timer_wheel;  // 定时器时间轮模块
 public:
     EventLoop():
         _thread_id(std::this_thread::get_id()), 
-        _event_fd(CreateEventFd()), 
+        _event_fd(CreateEventFd()),
         _event_channel(new Channel(this, _event_fd)),
         _timer_wheel(this) {
             // DBG_LOG("test 222");
@@ -589,26 +616,27 @@ public:
             // 包括timerfd在EventLoop中的读事件关心。外部可以调用TimerWheel的三个接口进行任务添加，刷新，删除~(RunInLoop)
             _event_channel->SetReadCallback(std::bind(&EventLoop::ReadEventfd, this));
             _event_channel->EnableRead();
-            // 将eventfd的读事件监督交给epoll(poller)，这样可以通过WriteEventfd来唤醒阻塞在epoll_wait中的epoll线程。
+            // 将eventfd的读事件监督交给epoll(poller)，这样可以通过WriteEventfd来唤醒阻塞在epoll_wait中的eventloop线程。
     }
     size_t Thread() { return std::hash<std::thread::id>{}(_thread_id); }
-    // 真-Event Loop
+    // 真 - Event Loop
     void Start() {
         // 事件监控 -> 事件处理 -> 执行任务
         while(1) {
             std::vector<Channel *> channels;
             poller.Poll(&channels);
-            for(auto &i:channels) {
-                i->HandleEvent();
+            for(auto &channel:channels) {
+                channel->HandleEvent();   // 处理就绪的事件
             }
-            RunAllTask();   // 执行任务
+            RunAllTask();   // 执行任务池中的任务
         }
     }
     void AssertInLoop() { assert(_thread_id == std::this_thread::get_id()); }
     // 用于判断当前线程是否是EventLoop对应的线程；
     bool IsInLoop() { return (_thread_id == std::this_thread::get_id()); }
-    // 判断执行RunInLoop的线程是否是该EventLoop绑定线程，若是，则直接执行任务即可, 若不是，则压入任务池中
+    // 判断执行RunInLoop的线程是否是该EventLoop绑定的线程，若是，则直接执行任务即可, 若不是，则压入任务池中
     // 一般来说，都是EventLoop所绑定的线程以外的线程来执行这个~
+    // 就是说想让这个EventLoop线程去执行个任务
     void RunInLoop(const Task &cb) {
         if (IsInLoop()) {
             return cb();
@@ -618,6 +646,7 @@ public:
     // 将操作压入任务池
     void QueueInLoop(const Task &cb) {
         {
+            // 加锁访问共享资源！_tasks：临界资源
             std::unique_lock<std::mutex> _lock(_mutex);
             _tasks.push_back(cb);
         }
@@ -739,9 +768,9 @@ private:
 class LoopThreadPool
 {
 private:
-    int _thread_num;   // 线程池内线程个数
-    int _loop_index;
-    EventLoop *_base_loop;
+    int _thread_num;   // 从属Reactor线程个数
+    int _loop_index;   // 主Reactor线程获取新连接之后需要负载均衡的dispatch给从属Reactor线程。
+    EventLoop *_base_loop; // 主Reactor线程对应的EventLoop
     std::vector<LoopThread *> _loop_threads;
     std::vector<EventLoop *> _event_loops;
 public:
