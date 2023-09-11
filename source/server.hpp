@@ -856,7 +856,7 @@ class Connection : public std::enable_shared_from_this<Connection>
 private:
     uint64_t _conn_id;  // 连接的唯一ID
     uint64_t _timer_id; // 连接对应的定时任务的ID(超时销毁)，具有唯一性即可，故为了方便默认设为_conn_id
-    int _sockfd;        // 连接关联的文件描述符
+    int _sockfd;        // 连接对应的的文件描述符
     ConnStatus _status; // 连接状态
     bool _enable_inactive_release; // 连接是否开启非活跃销毁，默认false
     EventLoop *_loop;   // 连接所在的EventLoop(epoll)
@@ -870,7 +870,7 @@ private:
     using ConnectedCallback = std::function<void (const PtrConnection &)>;
     using CloseCallback = std::function<void (const PtrConnection &)>;
     using AnyEventCallback = std::function<void (const PtrConnection &)>;
-    // HandleRead读事件回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
+    // HandleRead读事件回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer应用层接收缓冲区中之后
     // 进行业务处理，业务处理函数即_message_callback，是用户设定的（HandleRead方法内）
     MessageCallback _message_callback;
     // 连接建立完成时的回调函数，用户想让连接建立完成时执行个什么东西，就通过这个设定~（Establish方法内）比如上下文字段的设定~
@@ -881,8 +881,9 @@ private:
     // TcpServer模块设定的回调函数，用于在连接关闭时回调此方法删除TcpServer内保存的Connection
     CloseCallback _server_close_callback;
 public:
+    // 要知道，Connection对象构造时，其实就是主Reactor线程accept获取新连接之后进行构造Connection
     // 和Channel的构造的唯一区别就是多了一个_conn_id而已。在Connection构造时，会设定状态为CONNECTING
-    Connection(EventLoop *loop, uint64_t id, int sockfd):
+    Connection(int sockfd, EventLoop *loop, uint64_t id):
         _conn_id(id), _timer_id(id), _sockfd(sockfd), _status(CONNECTING), _enable_inactive_release(false),
         _loop(loop), _socket(_sockfd), _channel(_loop, _sockfd), _in_buffer(), _out_buffer() {
         _channel.SetReadCallback(std::bind(&Connection::HandleRead, this));
@@ -890,20 +891,21 @@ public:
         _channel.SetCloseCallback(std::bind(&Connection::HandleClose, this));
         _channel.SetErrorCallback(std::bind(&Connection::HandleError, this));
         _channel.SetEventCallback(std::bind(&Connection::HandleEvent, this));
+        // 在Channel中进行各种事件的回调函数的设定，但是此时还没有开启读事件关心，属于connecting状态。
         DBG_LOG("NEW CONNECTION: %p, sockfd:%d", this, _sockfd);
     }
     ~Connection() { 
         // _channel.RemoveFromEpoll();   // 从epoll模型中取出来
         DBG_LOG("RELEASE CONNECTION:%p, sockfd:%d", this, _sockfd); 
     }
-    // int Fd() { return _sockfd; } // useless 
-    // 打印Connection所属的EventLoop的线程id，for Debug
-    size_t Thread() { return _loop->Thread(); }
+    // int Fd() { return _sockfd; } // useless
+    // 打印Connection所属的EventLoop的线程id
+    size_t Thread() { return _loop->Thread(); }  // for Debug
     uint64_t Id() { return _conn_id; }
     // bool Connected() { return (_statu == CONNECTED); }    // useless
     void SetContext(const Any &context) { _context = context; }
     Any *GetContext() { return &_context; }  // 获取上下文，返回的是指针(HttpContext)
-    void SetMessageCallback(const MessageCallback &cb) { _message_callback = cb; }
+    void SetMessageCallback(const MessageCallback &cb) { _message_callback = cb; }    // 业务处理函数的设定
     void SetConnectedCallback(const ConnectedCallback &cb) { _connected_callback = cb; }
     void SetCloseCallback(const CloseCallback &cb) { _close_callback = cb; }
     void SetAnyEventCallback(const AnyEventCallback &cb) { _any_event_callback = cb; }
@@ -1074,6 +1076,7 @@ private:
     using AcceptCallback = std::function<void(int)>;
     Socket _listen_socket;
     Channel _channel;
+    // 具体主Reactor线程获取一个newfd之后，怎么分配到从Reactor线程池中，就是_accept_callback的工作了（TcpServer设定）
     AcceptCallback _accept_callback;
     // EventLoop *_base_loop;   // 没有存在的必要~
 public:
@@ -1088,10 +1091,12 @@ public:
     void Listen() { _channel.EnableRead(); }
 private:
     // 主Reactor线程会执行这个~
+    // 当listen套接字的读事件就绪时，自动回调此方法
+    // 说明这里的epoll是LT模式的，不是ET模式的。
     void HandleRead() {
         int newfd = _listen_socket.Accept();
         if(newfd < 0) return ;
-        // 具体主Reactor线程获取一个newfd之后，怎么分配到从Reactor线程池，就是_accept_callback的工作了（TcpServer设定）
+        // 具体主Reactor线程获取一个newfd之后，怎么分配到从Reactor线程池中，就是_accept_callback的工作了（TcpServer设定）
         if(_accept_callback) _accept_callback(newfd);    // NewConnection
     }
     int CreateListenSocket(int port) {
@@ -1099,19 +1104,19 @@ private:
         return _listen_socket.Fd();
     }
 };
-#define THREAD_NUM 3
+#define THREAD_NUM 3  // 从Reactor线程默认数量
 #define DEFAULT_TIMEOUT 30
 class TcpServer
 {
 private:
     uint64_t _conn_id;   // 自动增长的Connection ID
-    int _port;
-    int _timeout;
-    bool _enable_inactive_release;
+    int _port;           // TCPServer绑定端口号
+    int _timeout;        // 非活跃连接自动销毁的超时时间设定
+    bool _enable_inactive_release; // 是否开启非活跃连接自动销毁
     EventLoop _base_loop;    // 主Reactor线程执行_base_loop的Start
     Acceptor _acceptor;      // 监听套接字的管理对象
     LoopThreadPool _pool;    // 从属Reactor线程池
-    std::unordered_map<uint64_t, PtrConnection> _conns;   // //保存管理所有连接对应的shared_ptr对象
+    std::unordered_map<uint64_t, PtrConnection> _conns;   // 保存管理所有连接对应的shared_ptr对象
 
     // HandleRead读事件监控回调函数，从TCP内核接收缓冲区中读取数据，放到_in_buffer之后
     // 进行业务处理，业务处理函数即_message_callback，是用户设定的。
@@ -1136,7 +1141,6 @@ public:
             _acceptor.SetAcceptCallback(std::bind(&TcpServer::NewConnection, this, std::placeholders::_1));
             _acceptor.Listen();    // 在base_loop中开启listen套接字的读事件关心
             if(timeout > 0) {
-                _timeout = timeout;
                 _enable_inactive_release = true;
             }
     }
@@ -1163,8 +1167,8 @@ private:
     // 主Reactor线程获取新连接之后会执行这个~
     void NewConnection(int fd) {
         _conn_id++;
-        EventLoop *loop = _pool.GetLoopBalanced();
-        PtrConnection conn(new Connection(loop, _conn_id, fd));
+        EventLoop *loop = _pool.GetLoopBalanced();   // 获取一个从属Reactor线程。（若单Reactor单线程，则返回的就是base_loop）
+        PtrConnection conn(new Connection(fd, loop, _conn_id));
         // User设定的业务处理函数，一定需要的
         conn->SetMessageCallback(_message_callback);
         conn->SetConnectedCallback(_connected_callback);
@@ -1177,14 +1181,15 @@ private:
         _conns.insert({_conn_id, conn});
     }
     void RunAfterInLoop(Functor func, int delay) {
-        // 这里一定是base_loop对应线程在执行这里
+        // 这里一定是base_loop对应主Reactor线程在执行这里
         _conn_id++;
         _base_loop.TimerAddInLoop(_conn_id, delay, func);     // yzl~~
     }
     void RemoveConnection(const PtrConnection &conn) {
-        // 从属线程在关闭连接时会执行这里~，然后把实际关闭的任务交给主线程~
+        // 从属Reactor线程在关闭连接时会执行这里~，然后把实际关闭的任务交给主线程~
         _base_loop.RunInLoop(std::bind(&TcpServer::RemoveConnectionInLoop, this, conn));
     }
+    // 为什么不把这个方法直接放在上面这里呢？因为如果真的这样了，就多线程并发访问_conns了！！！！
     void RemoveConnectionInLoop(const PtrConnection &conn) {
         // 将Connection从_conns中移除掉
         uint64_t id = conn->Id();
